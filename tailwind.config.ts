@@ -9,27 +9,14 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        alabaster: "#F9FAFB",
-        charcoal: "#1C1917",
-        midnight: "#0F172A",
+        // The "World Beneath" Palette
         sage: {
-          DEFAULT: "#3F6212",
-          light: "#ECFCCB", // 20% opacity sage
-          text: "#365314",
+          light: '#e6f4f1', // Soft Nordic Green background
+          text: '#2d5a52',  // Deep Forest Green text
         },
-        clay: {
-          DEFAULT: "#BE123C",
-          light: "#FFE4E6",
-          text: "#881337",
-        },
+        charcoal: '#1e293b',
+        ice: '#f0f9ff',
       },
-      fontFamily: {
-        sans: ['"Inter Tight"', 'sans-serif'], // Premium Grotesque feel
-      },
-      boxShadow: {
-        'luxury': '0 4px 6px -1px rgba(0, 0, 0, 0.02), 0 2px 4px -1px rgba(0, 0, 0, 0.02)',
-        'lift': '0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -2px rgba(0, 0, 0, 0.025)',
-      }
     },
   },
   plugins: [],
