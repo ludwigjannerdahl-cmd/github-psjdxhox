@@ -3,10 +3,9 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   
-  // --- HARDCODED CONFIGURATION ---
+  // --- CONFIGURATION ---
   const supabaseUrl = "https://dtunbzugzcpzunnbvzmh.supabase.co";
   const supabaseKey = "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM";
-  
   const yahooClientId = "dj0yJmk9bzdvRlE2Y0ZzdTZaJmQ9WVdrOVpYaDZNWHB4VG1JbWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PWRh";
   const yahooClientSecret = "0c5463680eface4bb3958929f73c891d5618266a";
   const leagueId = "33897"; 
@@ -15,11 +14,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
-    // 1. Get Token from DB
+    // 1. Get Token
     const { data: authData } = await supabase.from('system_config').select('value').eq('key', 'yahoo_auth').single();
-    if (!authData) throw new Error("Auth token missing! Run the SQL script first.");
+    if (!authData) throw new Error("Auth token missing!");
 
-    // 2. Refresh Yahoo Token
+    // 2. Refresh Token
     const refreshRes = await fetch('https://api.login.yahoo.com/oauth2/get_token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -33,23 +32,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     });
     
     const newTokens = await refreshRes.json();
-    if (newTokens.error) {
-       throw new Error(`Yahoo Refresh Failed: ${JSON.stringify(newTokens)}`);
-    }
+    if (newTokens.error) throw new Error("Yahoo Refresh Failed");
 
-    // Save new token
     await supabase.from('system_config').update({
        value: { ...authData.value, access_token: newTokens.access_token }
     }).eq('key', 'yahoo_auth');
 
     // 3. THE LOOP: Fetch 300 Players
-    // Added ';out=ownership' to the URL to get the missing data
     let start = 0;
     const maxPlayers = 300; 
     let totalSynced = 0;
 
     while (start < maxPlayers) {
         
+        // Fetch with 'out=ownership' to get FA status
         const yahooRes = await fetch(
           `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;sort=AR;start=${start};count=25/stats;out=ownership?format=json`, 
           { headers: { 'Authorization': `Bearer ${newTokens.access_token}` } }
@@ -67,39 +63,45 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             
             const p = playersObj[key].player;
             
-            // --- PARSING LOGIC ---
-            // Yahoo returns arrays. We search for the specific objects we need.
-            const metaObj = p.find((i: any) => i.name); // Contains Name/Team
-            const statsObj = p.find((i: any) => i.player_stats); // Contains Goals/Assists
-            const ownerObj = p.find((i: any) => i.ownership); // Contains FA/Taken status
+            // --- CORRECTED PARSING LOGIC ---
+            // p[0] is an ARRAY of metadata objects (Name, Team, Ownership)
+            // p[1] is an OBJECT of stats
             
-            if (!metaObj || !statsObj) continue;
+            const metaArray = p[0]; 
+            const statsPayload = p[1];
 
-            const stats = statsObj.player_stats;
-            const meta = metaObj;
-            
+            if (!Array.isArray(metaArray)) continue;
+
+            // Helper to find data inside the metadata array
+            const nameNode = metaArray.find((i: any) => i.name);
+            const teamNode = metaArray.find((i: any) => i.editorial_team_abbr);
+            const positionNode = metaArray.find((i: any) => i.display_position);
+            const ownershipNode = metaArray.find((i: any) => i.ownership);
+            const idNode = metaArray.find((i: any) => i.player_id);
+
+            if (!nameNode) continue;
+
+            // Stats mapping
             const statMap: any = {};
-            if (stats && stats.stats) {
-                stats.stats.forEach((s: any) => statMap[s.stat_id] = s.value);
+            if (statsPayload?.player_stats?.stats) {
+                statsPayload.player_stats.stats.forEach((s: any) => statMap[s.stat_id] = s.value);
             }
 
-            // Stat Mapping (Based on your debug data):
-            // 4=Goals, 5=Assists, 31=Hits, 32=Blocks (Standard Yahoo)
+            // Stat IDs: 4=G, 5=A, 31=HIT, 32=BLK
             const goals = parseInt(statMap['4'] || '0');
             const assists = parseInt(statMap['5'] || '0');
             const hits = parseInt(statMap['31'] || '0');
             const blks = parseInt(statMap['32'] || '0');
 
-            // Determine Status (FA or TAKEN)
-            // If ownership_type is 'team', they are TAKEN.
-            const ownershipType = ownerObj?.ownership?.ownership_type || 'freeagents';
+            // Status Logic
+            const ownershipType = ownershipNode?.ownership?.ownership_type || 'freeagents';
             const status = ownershipType === 'team' ? 'TAKEN' : 'FA';
 
             updates.push({
-                nhl_id: parseInt(meta.player_id),
-                full_name: meta.name.full,
-                team: meta.editorial_team_abbr,
-                position: meta.display_position,
+                nhl_id: parseInt(idNode?.player_id || '0'),
+                full_name: nameNode.name.full,
+                team: teamNode?.editorial_team_abbr || 'UNK',
+                position: positionNode?.display_position || 'F',
                 goals, assists, hits, blocks: blks,
                 status: status,
                 fantasy_score: (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5),
@@ -113,7 +115,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         }
 
         start += 25;
-        // Pause to be kind to Yahoo API
         await new Promise(r => setTimeout(r, 500)); 
     }
 
