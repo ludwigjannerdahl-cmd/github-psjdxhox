@@ -18,6 +18,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const { data: authData } = await supabase.from('system_config').select('value').eq('key', 'yahoo_auth').single();
     if (!authData) throw new Error("Auth token missing!");
 
+    // 2. Refresh Token
     const refreshRes = await fetch('https://api.login.yahoo.com/oauth2/get_token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -37,74 +38,52 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
        value: { ...authData.value, access_token: newTokens.access_token }
     }).eq('key', 'yahoo_auth');
 
-    // 2. THE LOOP: Fetch 300 Players
-    let start = 0;
-    const maxPlayers = 300; 
-    let totalSynced = 0;
-
-    while (start < maxPlayers) {
-        
-        const yahooRes = await fetch(
-          `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;sort=AR;start=${start};count=25/stats?format=json`, 
-          { headers: { 'Authorization': `Bearer ${newTokens.access_token}` } }
-        );
-        
-        const yahooData = await yahooRes.json();
-        const playersObj = yahooData.fantasy_content?.league?.[1]?.players;
-
-        if (!playersObj || Object.keys(playersObj).length === 0) break;
-
-        const updates: any[] = [];
-
-        for (const key in playersObj) {
-            if (key === 'count') continue;
-            
-            const p = playersObj[key].player;
-            
-            // --- ROBUST PARSING (The Fix) ---
-            // Yahoo returns an array of objects. We must FIND the right ones.
-            const metaObj = p.find((i: any) => i.name); // Find object with name
-            const statsObj = p.find((i: any) => i.player_stats); // Find object with stats
-            const ownerObj = p.find((i: any) => i.ownership); // Find object with ownership
-            
-            if (!metaObj || !statsObj) continue; // Skip if bad data
-
-            const stats = statsObj.player_stats;
-            const meta = metaObj;
-            
-            const statMap: any = {};
-            if (stats && stats.stats) {
-                stats.stats.forEach((s: any) => statMap[s.stat_id] = s.value);
-            }
-
-            // Yahoo Stats IDs: 4=G, 5=A, 31=HIT, 32=BLK
-            const goals = parseInt(statMap['4'] || '0');
-            const assists = parseInt(statMap['5'] || '0');
-            const hits = parseInt(statMap['31'] || '0');
-            const blks = parseInt(statMap['32'] || '0');
-
-            updates.push({
-                nhl_id: parseInt(meta.player_id),
-                full_name: meta.name.full,
-                team: meta.editorial_team_abbr,
-                position: meta.display_position,
-                goals, assists, hits, blocks: blks,
-                status: ownerObj?.ownership?.ownership_type === 'freeagents' ? 'FA' : 'TAKEN',
-                fantasy_score: (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5),
-                last_updated: new Date().toISOString()
-            });
-        }
-
-        if (updates.length > 0) {
-            await supabase.from('players').upsert(updates, { onConflict: 'nhl_id' });
-            totalSynced += updates.length;
-        }
-
-        start += 25;
-        await new Promise(r => setTimeout(r, 500)); 
+    // 3. DEBUG FETCH
+    // We try to fetch just 1 player to inspect the data structure
+    const yahooRes = await fetch(
+      `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;sort=AR;start=0;count=1/stats?format=json`, 
+      { headers: { 'Authorization': `Bearer ${newTokens.access_token}` } }
+    );
+    
+    const yahooData = await yahooRes.json();
+    
+    // --- DIAGNOSTIC DUMP ---
+    // If we can't find players, we return the RAW data to see what's wrong
+    const leagueNode = yahooData.fantasy_content?.league;
+    
+    // Check if league exists
+    if (!leagueNode) {
+        return res.status(200).json({ 
+            error: "League Not Found", 
+            raw_response: yahooData 
+        });
     }
 
-    res.status(200).json({ success: true, message: `Synced ${totalSynced} players successfully!` });
+    // Try to find the players array (It might be in [0], [1], or a named property)
+    // We search the whole structure for it
+    let playersObj = null;
+    if (Array.isArray(leagueNode)) {
+        // Search array for the object containing 'players'
+        const playerNode = leagueNode.find((node: any) => node.players);
+        if (playerNode) playersObj = playerNode.players;
+    } else if (leagueNode.players) {
+        playersObj = leagueNode.players;
+    }
+
+    // If still 0, DUMP the JSON so we can fix the parsing logic
+    if (!playersObj || Object.keys(playersObj).length === 0) {
+         return res.status(200).json({ 
+            message: "Connected to Yahoo, but found 0 players. Check the structure below:", 
+            debug_structure: leagueNode 
+        });
+    }
+
+    // If we get here, it worked!
+    return res.status(200).json({ 
+        success: true, 
+        message: "PLAYERS FOUND! The logic works.",
+        sample_data: playersObj
+    });
 
   } catch (error: any) {
     res.status(500).json({ error: error.message, stack: error.stack });
