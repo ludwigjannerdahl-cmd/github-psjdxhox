@@ -1,27 +1,22 @@
 import { createClient } from '@supabase/supabase-js';
 import type { NextApiRequest, NextApiResponse } from 'next';
 
-// --- CONFIGURATION ---
-const supabaseUrl = "https://dtunbzugzcpzunnbvzmh.supabase.co";
-const supabaseKey = "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM";
-const yahooClientId = "dj0yJmk9bzdvRlE2Y0ZzdTZaJmQ9WVdrOVpYaDZNWHB4VG1JbWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PWRh";
-const yahooClientSecret = "0c5463680eface4bb3958929f73c891d5618266a";
-const leagueId = "33897"; 
-
-const supabase = createClient(supabaseUrl, supabaseKey);
-
-// Helper: Calculate Percentile Rank
-function getPercentileRank(array: number[], value: number) {
-  if (array.length === 0) return 0;
-  const smallerCount = array.filter(v => v < value).length;
-  return (smallerCount / array.length) * 100;
-}
-
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  
+  // --- HARDCODED KEYS ---
+  const supabaseUrl = "https://dtunbzugzcpzunnbvzmh.supabase.co";
+  const supabaseKey = "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM";
+  const yahooClientId = "dj0yJmk9bzdvRlE2Y0ZzdTZaJmQ9WVdrOVpYaDZNWHB4VG1JbWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PWRh";
+  const yahooClientSecret = "0c5463680eface4bb3958929f73c891d5618266a";
+  const leagueId = "33897"; 
+  // ---------------------
+
+  const supabase = createClient(supabaseUrl, supabaseKey);
+
   try {
-    // 1. Get & Refresh Token (Same as before)
+    // 1. Get & Refresh Token
     const { data: authData } = await supabase.from('system_config').select('value').eq('key', 'yahoo_auth').single();
-    if (!authData) throw new Error("Auth token missing.");
+    if (!authData) throw new Error("Auth token missing!");
 
     const refreshRes = await fetch('https://api.login.yahoo.com/oauth2/get_token', {
       method: 'POST',
@@ -34,90 +29,78 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         grant_type: 'refresh_token'
       })
     });
-    const tokens = await refreshRes.json();
-    if (tokens.error) throw new Error("Yahoo Refresh Failed");
+    
+    const newTokens = await refreshRes.json();
+    if (newTokens.error) throw new Error("Yahoo Refresh Failed");
 
     await supabase.from('system_config').update({
-       value: { ...authData.value, access_token: tokens.access_token }
+       value: { ...authData.value, access_token: newTokens.access_token }
     }).eq('key', 'yahoo_auth');
 
-    // 2. Fetch ALL Players (Looping to get ~200-300 relevant players)
-    // We fetch a larger batch to build a proper statistical population
-    const yahooRes = await fetch(
-      `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;sort=AR;start=0;count=100/stats?format=json`, 
-      { headers: { 'Authorization': `Bearer ${tokens.access_token}` } }
-    );
-    const yahooData = await yahooRes.json();
-    const playersObj = yahooData.fantasy_content?.league?.[1]?.players;
+    // 2. THE LOOP: Fetch 300 Players (Batches of 25)
+    // Yahoo limits us to 25 players per request. We loop 12 times.
+    let start = 0;
+    const maxPlayers = 300; 
+    let totalSynced = 0;
 
-    if (!playersObj) throw new Error("Yahoo returned no players.");
+    while (start < maxPlayers) {
+        console.log(`Fetching players starting at ${start}...`);
+        
+        // Fetch batch
+        const yahooRes = await fetch(
+          `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;sort=AR;start=${start};count=25/stats?format=json`, 
+          { headers: { 'Authorization': `Bearer ${newTokens.access_token}` } }
+        );
+        
+        const yahooData = await yahooRes.json();
+        const playersObj = yahooData.fantasy_content?.league?.[1]?.players;
 
-    let rawPlayers: any[] = [];
+        if (!playersObj || Object.keys(playersObj).length === 0) break; // Stop if no more players
 
-    // 3. Parse Raw Data
-    for (const key in playersObj) {
-        if (key === 'count') continue;
-        const p = playersObj[key].player;
-        const meta = p[0];
-        const stats = p[1].player_stats;
-        const ownership = p[0].find((i: any) => i.ownership)?.ownership;
+        const updates: any[] = [];
 
-        const statMap: any = {};
-        stats.stats.forEach((s: any) => statMap[s.stat_id] = parseFloat(s.value) || 0);
+        for (const key in playersObj) {
+            if (key === 'count') continue;
+            
+            const p = playersObj[key].player;
+            const meta = p[0]; 
+            const stats = p[1].player_stats;
+            const ownership = p[0].find((i: any) => i.ownership)?.ownership;
 
-        rawPlayers.push({
-            nhl_id: parseInt(meta[1].player_id),
-            full_name: meta[2].name.full,
-            team: meta[6].editorial_team_abbr,
-            position: meta[10].display_position,
-            status: ownership?.ownership_type === 'freeagents' ? 'FA' : 'TAKEN',
-            // Raw Stats
-            goals: statMap['4'] || 0,
-            assists: statMap['5'] || 0,
-            plus_minus: statMap['9'] || 0, // Check your league ID for +/-
-            pim: statMap['14'] || 0,
-            ppp: statMap['25'] || 0, // Check league ID
-            sog: statMap['31'] || 0,
-            hits: statMap['32'] || 0, // ID might vary
-            blocks: statMap['33'] || 0, // ID might vary
-            last_updated: new Date().toISOString()
-        });
+            const statMap: any = {};
+            stats.stats.forEach((s: any) => statMap[s.stat_id] = s.value);
+
+            // Yahoo Stats: 4=G, 5=A, 31=HIT, 32=BLK (Verify these IDs in your league settings if they look off!)
+            const goals = parseInt(statMap['4'] || '0');
+            const assists = parseInt(statMap['5'] || '0');
+            const hits = parseInt(statMap['31'] || '0');
+            const blks = parseInt(statMap['32'] || '0');
+
+            updates.push({
+                nhl_id: parseInt(meta[1].player_id),
+                full_name: meta[2].name.full,
+                team: meta[6].editorial_team_abbr,
+                position: meta[10].display_position,
+                goals, assists, hits, blocks: blks,
+                status: ownership?.ownership_type === 'freeagents' ? 'FA' : 'TAKEN',
+                fantasy_score: (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5),
+                last_updated: new Date().toISOString()
+            });
+        }
+
+        // Upsert this batch
+        if (updates.length > 0) {
+            await supabase.from('players').upsert(updates, { onConflict: 'nhl_id' });
+            totalSynced += updates.length;
+        }
+
+        start += 25; // Next page
+        
+        // Small pause to be nice to Yahoo API
+        await new Promise(r => setTimeout(r, 500)); 
     }
 
-    // 4. THE NORDIC ENGINE: Calculate Percentiles
-    // Extract arrays for every category to compare against
-    const goalsArr = rawPlayers.map(p => p.goals);
-    const assistsArr = rawPlayers.map(p => p.assists);
-    const hitsArr = rawPlayers.map(p => p.hits);
-    const blocksArr = rawPlayers.map(p => p.blocks);
-    const sogArr = rawPlayers.map(p => p.sog);
-    const pppArr = rawPlayers.map(p => p.ppp);
-
-    const finalPlayers = rawPlayers.map(p => {
-        // Calculate Percentile (0-100) for each category
-        const p_goals = getPercentileRank(goalsArr, p.goals);
-        const p_assists = getPercentileRank(assistsArr, p.assists);
-        const p_hits = getPercentileRank(hitsArr, p.hits);
-        const p_blocks = getPercentileRank(blocksArr, p.blocks);
-        const p_sog = getPercentileRank(sogArr, p.sog);
-        const p_ppp = getPercentileRank(pppArr, p.ppp);
-
-        // The "Overall Score" (Average of percentiles)
-        // You can weight this! (e.g. Goals * 1.2)
-        const overall = (p_goals + p_assists + p_hits + p_blocks + p_sog + p_ppp) / 6;
-
-        return {
-            ...p,
-            fantasy_score: parseFloat(overall.toFixed(1)), // 0-100 Score
-            x_score: parseFloat((overall * 1.1).toFixed(1)) // Mock xScore for now
-        };
-    });
-
-    // 5. Upsert to DB
-    const { error } = await supabase.from('players').upsert(finalPlayers, { onConflict: 'nhl_id' });
-    if (error) throw error;
-
-    res.status(200).json({ success: true, count: finalPlayers.length });
+    res.status(200).json({ success: true, message: `Synced ${totalSynced} players successfully!` });
 
   } catch (error: any) {
     res.status(500).json({ error: error.message });
