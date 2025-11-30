@@ -14,9 +14,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
-    // 1. Auth & Refresh
+    // 1. Get & Refresh Token
     const { data: authData } = await supabase.from('system_config').select('value').eq('key', 'yahoo_auth').single();
-    if (!authData) throw new Error("Auth token missing! Run the SQL script first.");
+    if (!authData) return res.status(500).json({ error: "Auth token missing." });
 
     const refreshRes = await fetch('https://api.login.yahoo.com/oauth2/get_token', {
       method: 'POST',
@@ -31,115 +31,30 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     });
     
     const newTokens = await refreshRes.json();
-    if (newTokens.error) throw new Error("Yahoo Refresh Failed");
+    if (newTokens.error) return res.status(500).json({ error: "Refresh Failed", details: newTokens });
 
+    // Save token
     await supabase.from('system_config').update({
        value: { ...authData.value, access_token: newTokens.access_token }
     }).eq('key', 'yahoo_auth');
 
-    // 2. THE LOOP: Fetch 300 Players
-    let start = 0;
-    const maxPlayers = 300; 
-    let totalSynced = 0;
+    // 2. THE X-RAY FETCH
+    // We fetch just 1 player to keep the output small and readable
+    const yahooRes = await fetch(
+      `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;sort=AR;start=0;count=1/stats?format=json`, 
+      { headers: { 'Authorization': `Bearer ${newTokens.access_token}` } }
+    );
+    
+    const yahooData = await yahooRes.json();
 
-    while (start < maxPlayers) {
-        
-        const yahooRes = await fetch(
-          `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;sort=AR;start=${start};count=25/stats;out=ownership?format=json`, 
-          { headers: { 'Authorization': `Bearer ${newTokens.access_token}` } }
-        );
-        
-        const yahooData = await yahooRes.json();
-        
-        // --- SENIOR DEV FIX: RECURSIVE FINDER ---
-        // Instead of guessing the path (league[1].players), we hunt for it.
-        const playersCollection = findKey(yahooData, 'players');
-
-        // Check if we found valid data
-        if (!playersCollection || Object.keys(playersCollection).length === 0 || (Object.keys(playersCollection).length === 1 && playersCollection.count)) {
-             if (start === 0) {
-                 // If we find NOTHING on the first try, dump the structure to debug
-                 return res.status(200).json({ 
-                    error: "Could not find 'players' data node.", 
-                    debug_dump: JSON.stringify(yahooData).substring(0, 1000) 
-                });
-             }
-             break; // Done fetching
-        }
-
-        const updates: any[] = [];
-
-        for (const key in playersCollection) {
-            if (key === 'count') continue; // Skip the metadata key
-            
-            const p = playersCollection[key].player;
-            if (!p) continue; // Skip malformed entries
-
-            // --- ROBUST PARSING ---
-            // Find the components regardless of their array index
-            const metaObj = p.find((i: any) => i.name);
-            const statsObj = p.find((i: any) => i.player_stats);
-            const ownerObj = p.find((i: any) => i.ownership);
-            
-            if (!metaObj || !statsObj) continue;
-
-            const stats = statsObj.player_stats;
-            const meta = metaObj;
-            
-            const statMap: any = {};
-            if (stats && stats.stats) {
-                stats.stats.forEach((s: any) => statMap[s.stat_id] = s.value);
-            }
-
-            // Stat IDs: 4=G, 5=A, 31=HIT, 32=BLK
-            const goals = parseInt(statMap['4'] || '0');
-            const assists = parseInt(statMap['5'] || '0');
-            const hits = parseInt(statMap['31'] || '0');
-            const blks = parseInt(statMap['32'] || '0');
-
-            // Status Logic
-            const ownershipType = ownerObj?.ownership?.ownership_type || 'freeagents';
-            const status = ownershipType === 'team' ? 'TAKEN' : 'FA';
-
-            updates.push({
-                nhl_id: parseInt(meta.player_id),
-                full_name: meta.name.full,
-                team: meta.editorial_team_abbr,
-                position: meta.display_position,
-                goals, assists, hits, blocks: blks,
-                status: status,
-                fantasy_score: (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5),
-                last_updated: new Date().toISOString()
-            });
-        }
-
-        if (updates.length > 0) {
-            await supabase.from('players').upsert(updates, { onConflict: 'nhl_id' });
-            totalSynced += updates.length;
-        }
-
-        start += 25;
-        await new Promise(r => setTimeout(r, 500)); 
-    }
-
-    res.status(200).json({ success: true, message: `Synced ${totalSynced} players successfully!` });
+    // 3. DUMP THE RAW DATA
+    // This will print the exact structure to your browser window
+    return res.status(200).json({ 
+        debug_mode: true,
+        yahoo_response: yahooData 
+    });
 
   } catch (error: any) {
-    res.status(500).json({ error: error.message, stack: error.stack });
+    res.status(500).json({ error: error.message });
   }
-}
-
-// --- HELPER FUNCTION: THE HUNTER ---
-// Recursively searches a JSON object to find a key named 'targetKey'
-function findKey(obj: any, targetKey: string): any {
-    if (!obj || typeof obj !== 'object') return null;
-    if (obj[targetKey]) return obj[targetKey];
-
-    for (const key in obj) {
-        if (typeof obj[key] === 'object') {
-            const result = findKey(obj[key], targetKey);
-            if (result) return result;
-        }
-    }
-    return null;
 }
