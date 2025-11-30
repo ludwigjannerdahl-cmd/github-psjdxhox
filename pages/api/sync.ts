@@ -4,10 +4,8 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   
   // --- CONFIGURATION ---
-  // I extracted these from your screenshots:
   const supabaseUrl = "https://dtunbzugzcpzunnbvzmh.supabase.co";
   const supabaseKey = "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM";
-
   const yahooClientId = "dj0yJmk9bzdvRlE2Y0ZzdTZaJmQ9WVdrOVpYaDZNWHB4VG1JbWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PWRh";
   const yahooClientSecret = "0c5463680eface4bb3958929f73c891d5618266a";
   const leagueId = "33897"; 
@@ -16,11 +14,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
-    // 1. Get Token from DB
+    // 1. Auth & Refresh
     const { data: authData } = await supabase.from('system_config').select('value').eq('key', 'yahoo_auth').single();
     if (!authData) throw new Error("Auth token missing! Run the SQL script first.");
 
-    // 2. Refresh Yahoo Token
     const refreshRes = await fetch('https://api.login.yahoo.com/oauth2/get_token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -34,17 +31,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     });
     
     const newTokens = await refreshRes.json();
-    if (newTokens.error) {
-       throw new Error(`Yahoo Refresh Failed: ${JSON.stringify(newTokens)}`);
-    }
+    if (newTokens.error) throw new Error("Yahoo Refresh Failed");
 
-    // Save new token
     await supabase.from('system_config').update({
-       value: { ...authData.value, access_token: newTokens.access_token, expires_at: Date.now() + 3600 * 1000 }
+       value: { ...authData.value, access_token: newTokens.access_token }
     }).eq('key', 'yahoo_auth');
 
-    // 3. THE LOOP: Fetch 300 Players
-    // We request 'stats' AND 'ownership' in one call.
+    // 2. THE LOOP: Fetch 300 Players
     let start = 0;
     const maxPlayers = 300; 
     let totalSynced = 0;
@@ -57,59 +50,62 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         );
         
         const yahooData = await yahooRes.json();
-        const playersObj = yahooData.fantasy_content?.league?.[1]?.players;
+        
+        // --- SENIOR DEV FIX: RECURSIVE FINDER ---
+        // Instead of guessing the path (league[1].players), we hunt for it.
+        const playersCollection = findKey(yahooData, 'players');
 
-        if (!playersObj || Object.keys(playersObj).length === 0) break;
+        // Check if we found valid data
+        if (!playersCollection || Object.keys(playersCollection).length === 0 || (Object.keys(playersCollection).length === 1 && playersCollection.count)) {
+             if (start === 0) {
+                 // If we find NOTHING on the first try, dump the structure to debug
+                 return res.status(200).json({ 
+                    error: "Could not find 'players' data node.", 
+                    debug_dump: JSON.stringify(yahooData).substring(0, 1000) 
+                });
+             }
+             break; // Done fetching
+        }
 
         const updates: any[] = [];
 
-        // Iterate over the numeric keys ("0", "1", "2"...)
-        for (const key in playersObj) {
-            if (key === 'count') continue;
+        for (const key in playersCollection) {
+            if (key === 'count') continue; // Skip the metadata key
             
-            const p = playersObj[key].player;
-            
-            // --- THE CORRECT PARSING LOGIC (THE FIX) ---
-            // p[0] is an ARRAY containing Metadata (Name, Team)
-            // p[1] is an OBJECT containing Stats
-            // p[2] is an OBJECT containing Ownership (sometimes)
-            
-            const metaArray = p[0]; 
-            // We search the rest of the array for stats and ownership objects
+            const p = playersCollection[key].player;
+            if (!p) continue; // Skip malformed entries
+
+            // --- ROBUST PARSING ---
+            // Find the components regardless of their array index
+            const metaObj = p.find((i: any) => i.name);
             const statsObj = p.find((i: any) => i.player_stats);
             const ownerObj = p.find((i: any) => i.ownership);
+            
+            if (!metaObj || !statsObj) continue;
 
-            if (!Array.isArray(metaArray)) continue;
-
-            // 1. Find Name & Info inside the first array
-            const nameNode = metaArray.find((i: any) => i.name);
-            const teamNode = metaArray.find((i: any) => i.editorial_team_abbr);
-            const positionNode = metaArray.find((i: any) => i.display_position);
-            const idNode = metaArray.find((i: any) => i.player_id);
-
-            if (!nameNode) continue;
-
-            // 2. Extract Stats
+            const stats = statsObj.player_stats;
+            const meta = metaObj;
+            
             const statMap: any = {};
-            if (statsObj?.player_stats?.stats) {
-                statsObj.player_stats.stats.forEach((s: any) => statMap[s.stat_id] = s.value);
+            if (stats && stats.stats) {
+                stats.stats.forEach((s: any) => statMap[s.stat_id] = s.value);
             }
 
-            // Yahoo Stat Mapping: 4=G, 5=A, 31=HIT, 32=BLK (Standard)
+            // Stat IDs: 4=G, 5=A, 31=HIT, 32=BLK
             const goals = parseInt(statMap['4'] || '0');
             const assists = parseInt(statMap['5'] || '0');
             const hits = parseInt(statMap['31'] || '0');
             const blks = parseInt(statMap['32'] || '0');
 
-            // 3. Extract Ownership
+            // Status Logic
             const ownershipType = ownerObj?.ownership?.ownership_type || 'freeagents';
             const status = ownershipType === 'team' ? 'TAKEN' : 'FA';
 
             updates.push({
-                nhl_id: parseInt(idNode?.player_id || '0'),
-                full_name: nameNode.name.full,
-                team: teamNode?.editorial_team_abbr || 'UNK',
-                position: positionNode?.display_position || 'F',
+                nhl_id: parseInt(meta.player_id),
+                full_name: meta.name.full,
+                team: meta.editorial_team_abbr,
+                position: meta.display_position,
                 goals, assists, hits, blocks: blks,
                 status: status,
                 fantasy_score: (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5),
@@ -131,4 +127,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   } catch (error: any) {
     res.status(500).json({ error: error.message, stack: error.stack });
   }
+}
+
+// --- HELPER FUNCTION: THE HUNTER ---
+// Recursively searches a JSON object to find a key named 'targetKey'
+function findKey(obj: any, targetKey: string): any {
+    if (!obj || typeof obj !== 'object') return null;
+    if (obj[targetKey]) return obj[targetKey];
+
+    for (const key in obj) {
+        if (typeof obj[key] === 'object') {
+            const result = findKey(obj[key], targetKey);
+            if (result) return result;
+        }
+    }
+    return null;
 }
