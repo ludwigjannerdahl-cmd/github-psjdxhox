@@ -3,7 +3,7 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   
-  // --- CONFIGURATION ---
+  // --- HARDCODED CONFIGURATION ---
   const supabaseUrl = "https://dtunbzugzcpzunnbvzmh.supabase.co";
   const supabaseKey = "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM";
   
@@ -33,7 +33,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     });
     
     const newTokens = await refreshRes.json();
-    
     if (newTokens.error) {
        throw new Error(`Yahoo Refresh Failed: ${JSON.stringify(newTokens)}`);
     }
@@ -43,79 +42,67 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
        value: { ...authData.value, access_token: newTokens.access_token, expires_at: Date.now() + 3600 * 1000 }
     }).eq('key', 'yahoo_auth');
 
-    // 3. Fetch Yahoo "Taken" Players
-    const takenNames = new Set();
-    let yahooDebugMsg = "Yahoo fetch skipped";
+    // 3. Fetch Players Directly from Yahoo
+    // We fetch "Top 25 Taken Players" to start. Yahoo limits us to 25 at a time.
+    // 'status=A' means All players. 'sort=AR' means Actual Rank (Best players first).
+    const yahooRes = await fetch(
+      `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;sort=AR;start=0;count=25/stats?format=json`, 
+      { headers: { 'Authorization': `Bearer ${newTokens.access_token}` } }
+    );
+    
+    const yahooData = await yahooRes.json();
+    const playersObj = yahooData.fantasy_content?.league?.[1]?.players;
 
-    try {
-        const yahooRes = await fetch(
-          `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;status=T;start=0;count=100?format=json`, 
-          { headers: { 'Authorization': `Bearer ${newTokens.access_token}` } }
-        );
+    if (!playersObj) throw new Error("Yahoo returned no players. Check League ID.");
+
+    const updates: any[] = [];
+
+    // Parse the complex Yahoo JSON structure
+    for (const key in playersObj) {
+        if (key === 'count') continue;
         
-        if (yahooRes.ok) {
-            const yahooData = await yahooRes.json();
-            const players = yahooData.fantasy_content?.league?.[1]?.players;
-            
-            if (players) {
-                for (const key in players) {
-                    const p = players[key].player;
-                    if (p && Array.isArray(p) && p[0] && Array.isArray(p[0])) {
-                        const nameObj = p[0].find((i: any) => i.name);
-                        if (nameObj) takenNames.add(nameObj.name.full);
-                    }
-                }
-                yahooDebugMsg = `Found ${takenNames.size} taken players.`;
-            }
-        }
-    } catch (e: any) { 
-        yahooDebugMsg = `Yahoo parsing warning: ${e.message}`;
-        console.error(yahooDebugMsg); 
+        const p = playersObj[key].player;
+        const meta = p[0]; // Name, Team, Position
+        const stats = p[1].player_stats; // The numbers
+        const ownership = p[0].find((i: any) => i.ownership)?.ownership; // FA vs Team
+
+        // Safely extract stats (Stat ID 4=Goals, 5=Assists, etc. - mapping varies by league)
+        // For simplicity, we grab the raw stats array
+        const statMap: any = {};
+        stats.stats.forEach((s: any) => statMap[s.stat_id] = s.value);
+
+        // Standard Yahoo Stat IDs: 4=G, 5=A, 14=PIM, 31=HIT, 32=BLK (Check your league settings!)
+        // Assuming standard mapping for now:
+        const goals = parseInt(statMap['4'] || '0');
+        const assists = parseInt(statMap['5'] || '0');
+        const hits = parseInt(statMap['31'] || '0');
+        const blks = parseInt(statMap['32'] || '0');
+
+        updates.push({
+            nhl_id: parseInt(meta[1].player_id), // Use Yahoo ID as primary
+            full_name: meta[2].name.full,
+            team: meta[6].editorial_team_abbr,
+            position: meta[10].display_position,
+            goals: goals,
+            assists: assists,
+            hits: hits,
+            blocks: blks,
+            status: ownership?.ownership_type === 'freeagents' ? 'FA' : 'TAKEN',
+            fantasy_score: (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5),
+            last_updated: new Date().toISOString()
+        });
     }
-
-    // 4. Fetch Official NHL Stats (LIVE SEASON 2025/2026)
-    // We switched the year code to '20252026'
-    const nhlRes = await fetch('https://api-web.nhle.com/v1/skater-stats-leaders/20252026/2?categories=goals&limit=200');
-    
-    if (!nhlRes.ok) throw new Error(`NHL API Error: ${nhlRes.status}`);
-    
-    const nhlData = await nhlRes.json();
-
-    if (!nhlData.skaters) {
-        throw new Error("NHL API returned valid JSON but no 'skaters' list. Season might not have stats yet.");
-    }
-
-    // 5. Merge & Upsert
-    const updates = nhlData.skaters.map((p: any) => {
-       const fullName = `${p.firstName.default} ${p.lastName.default}`;
-       const isTaken = takenNames.has(fullName);
-
-       return {
-         nhl_id: p.id,
-         full_name: fullName,
-         team: p.teamAbbrev,
-         position: p.positionCode,
-         goals: p.goals,
-         assists: p.assists,
-         points: p.points,
-         plus_minus: p.plusMinus,
-         hits: p.hits || 0,
-         blocks: p.blockedShots || 0,
-         status: isTaken ? 'TAKEN' : 'FA',
-         fantasy_score: (p.goals * 3) + (p.assists * 2) + (p.hits * 0.5) + (p.blockedShots * 0.5),
-         last_updated: new Date().toISOString()
-       };
-    });
 
     const { error } = await supabase.from('players').upsert(updates, { onConflict: 'nhl_id' });
     if (error) throw error;
 
     res.status(200).json({ 
         success: true, 
-        message: `Synced ${updates.length} players from 2025/26 Season. Yahoo Status: ${yahooDebugMsg}` 
+        message: `Synced ${updates.length} players purely from Yahoo!`,
+        sample_player: updates[0].full_name
     });
 
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message, stack: error.stack });
   }
 }
