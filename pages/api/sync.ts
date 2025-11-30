@@ -3,14 +3,14 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   
-  // --- HARDCODED CONFIGURATION ---
+  // --- HARDCODED KEYS ---
   const supabaseUrl = "https://dtunbzugzcpzunnbvzmh.supabase.co";
   const supabaseKey = "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM";
   
   const yahooClientId = "dj0yJmk9bzdvRlE2Y0ZzdTZaJmQ9WVdrOVpYaDZNWHB4VG1JbWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PWRh";
   const yahooClientSecret = "0c5463680eface4bb3958929f73c891d5618266a";
   const leagueId = "33897"; 
-  // ------------------------------
+  // ---------------------
 
   const supabase = createClient(supabaseUrl, supabaseKey);
 
@@ -33,80 +33,91 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     });
     
     const newTokens = await refreshRes.json();
-    if (newTokens.error) {
-       // Log the specific error from Yahoo to help debug
-       throw new Error(`Yahoo Refresh Failed: ${JSON.stringify(newTokens)}`);
-    }
+    if (newTokens.error) throw new Error(`Yahoo Refresh Failed: ${JSON.stringify(newTokens)}`);
 
     // Save new token
     await supabase.from('system_config').update({
        value: { ...authData.value, access_token: newTokens.access_token, expires_at: Date.now() + 3600 * 1000 }
     }).eq('key', 'yahoo_auth');
 
-    // 3. Fetch Yahoo "Taken" Players
-    // We wrap this in a try/catch so if Yahoo fails, we still get the NHL stats
-    const takenNames = new Set();
-    try {
+    // 3. Fetch Top 100 Players from Yahoo (Looping 25 at a time)
+    // We fetch "Actual Rank" (sort=AR) to get the best players first.
+    let allPlayers: any[] = [];
+    const batchSize = 25;
+    
+    // Fetch 4 batches (100 players total)
+    for (let start = 0; start < 100; start += batchSize) {
+        console.log(`Fetching Yahoo batch starting at ${start}...`);
+        
         const yahooRes = await fetch(
-          `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;status=T;start=0;count=100?format=json`, 
+          `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;sort=AR;start=${start};count=${batchSize}/stats?format=json`, 
           { headers: { 'Authorization': `Bearer ${newTokens.access_token}` } }
         );
-        const yahooData = await yahooRes.json();
-        const players = yahooData.fantasy_content?.league?.[1]?.players;
         
-        if (players) {
-            for (const key in players) {
-                if (players[key].player) takenNames.add(players[key].player[0][2].name.full);
-            }
+        const yahooData = await yahooRes.json();
+        const playersObj = yahooData.fantasy_content?.league?.[1]?.players;
+
+        if (playersObj) {
+            // Yahoo returns an object with keys "0", "1", ... "count". We need to parse it.
+            Object.values(playersObj).forEach((p: any) => {
+                if (p.player) allPlayers.push(p.player);
+            });
         }
-    } catch (e) { 
-        console.warn("Yahoo roster fetch partial error (ignoring):", e); 
     }
 
-    // 4. Fetch Official NHL Stats (FIXED: Using 'current' endpoint)
-    const nhlRes = await fetch('https://api-web.nhle.com/v1/skater-stats-leaders/current?categories=goals&limit=200');
-    
-    if (!nhlRes.ok) throw new Error(`NHL API Error: ${nhlRes.status}`);
-    
-    const nhlData = await nhlRes.json();
+    // 4. Transform Data for Database
+    const updates = allPlayers.map((data) => {
+        // Yahoo Data Structure is messy: [ [Metadata], {Stats} ]
+        const meta = data[0]; 
+        const statsObj = data[1]?.player_stats?.stats;
 
-    // SAFETY CHECK: Did we actually get skaters?
-    if (!nhlData.skaters) {
-        throw new Error("NHL API returned valid JSON but no 'skaters' list. Season might be inactive.");
-    }
+        // Helper to find stat value by ID
+        const getStat = (id: string) => {
+            const s = statsObj.find((x: any) => x.stat.stat_id === id);
+            return s ? parseFloat(s.stat.value) || 0 : 0;
+        };
 
-    // 5. Merge & Upsert
-    const updates = nhlData.skaters.map((p: any) => {
-       const fullName = `${p.firstName.default} ${p.lastName.default}`;
-       const isTaken = takenNames.has(fullName);
+        // Yahoo NHL Stat IDs: 
+        // 1=G, 2=A, 3=Pts, 4=+/-, 5=PIM, 8=PPP, 14=SOG, 31=HIT, 32=BLK
+        const goals = getStat("1");
+        const assists = getStat("2");
+        const hits = getStat("31");
+        const blocks = getStat("32");
 
-       return {
-         nhl_id: p.id,
-         full_name: fullName,
-         team: p.teamAbbrev,
-         position: p.positionCode,
-         goals: p.goals,
-         assists: p.assists,
-         points: p.points,
-         plus_minus: p.plusMinus,
-         hits: p.hits || 0,
-         blocks: p.blockedShots || 0,
-         status: isTaken ? 'TAKEN' : 'FA',
-         fantasy_score: (p.goals * 3) + (p.assists * 2) + (p.hits * 0.5) + (p.blockedShots * 0.5),
-         last_updated: new Date().toISOString()
-       };
+        // Calculate simple fantasy score
+        const fantasyScore = (goals * 3) + (assists * 2) + (hits * 0.5) + (blocks * 0.5);
+
+        return {
+            nhl_id: parseInt(meta[1].player_id), // Yahoo uses the same ID as NHL usually
+            full_name: meta[2].name.full,
+            team: meta[6].editorial_team_abbr,
+            position: meta[4].display_position,
+            status: meta[3].ownership.ownership_type === 'team' ? 'TAKEN' : 'FA', // "team" means owned, "freeagents" means FA
+            goals: goals,
+            assists: assists,
+            points: getStat("3"),
+            plus_minus: getStat("4"),
+            pim: getStat("5"),
+            ppp: getStat("8"),
+            sog: getStat("14"),
+            hits: hits,
+            blocks: blocks,
+            fantasy_score: fantasyScore,
+            last_updated: new Date().toISOString()
+        };
     });
 
+    // 5. Upsert to Supabase
     const { error } = await supabase.from('players').upsert(updates, { onConflict: 'nhl_id' });
     if (error) throw error;
 
     res.status(200).json({ 
         success: true, 
-        message: `Synced ${updates.length} players. Found ${takenNames.size} taken in Yahoo.` 
+        message: `Synced ${updates.length} players directly from Yahoo!`,
+        sample_player: updates[0].full_name
     });
 
   } catch (error: any) {
-    // Return the actual error message to the screen so we can see it
     res.status(500).json({ error: error.message });
   }
 }
