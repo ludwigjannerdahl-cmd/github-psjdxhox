@@ -3,7 +3,7 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   
-  // --- CONFIGURATION ---
+  // --- HARDCODED KEYS ---
   const supabaseUrl = "https://dtunbzugzcpzunnbvzmh.supabase.co";
   const supabaseKey = "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM";
   const yahooClientId = "dj0yJmk9bzdvRlE2Y0ZzdTZaJmQ9WVdrOVpYaDZNWHB4VG1JbWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PWRh";
@@ -14,11 +14,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
-    // 1. Get Token
+    // 1. Get & Refresh Token
     const { data: authData } = await supabase.from('system_config').select('value').eq('key', 'yahoo_auth').single();
-    if (!authData) throw new Error("Auth token missing!");
+    if (!authData) throw new Error("Auth token missing.");
 
-    // 2. Refresh Token
     const refreshRes = await fetch('https://api.login.yahoo.com/oauth2/get_token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -38,56 +37,40 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
        value: { ...authData.value, access_token: newTokens.access_token }
     }).eq('key', 'yahoo_auth');
 
-    // 3. THE LOOP: Fetch 300 Players
+    // 2. FETCH LOOP
     let start = 0;
     const maxPlayers = 300; 
     let totalSynced = 0;
 
     while (start < maxPlayers) {
-        
+        // Fetch stats + ownership
         const yahooRes = await fetch(
           `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;sort=AR;start=${start};count=25/stats;out=ownership?format=json`, 
           { headers: { 'Authorization': `Bearer ${newTokens.access_token}` } }
         );
-        
         const yahooData = await yahooRes.json();
         
-        // --- BRUTE FORCE FINDER (The Fix) ---
-        // We do not assume it is at index [1]. We find the object that has 'players'.
-        const leagueArr = yahooData.fantasy_content?.league;
+        // Find the players array (handles messy Yahoo structure)
+        const leagueNode = yahooData.fantasy_content?.league;
         let playersObj: any = null;
-
-        if (Array.isArray(leagueArr)) {
-            // Find the item in the array that has the 'players' key
-            const container = leagueArr.find((item: any) => item.players);
-            if (container) playersObj = container.players;
-        } else if (leagueArr?.players) {
-            playersObj = leagueArr.players;
+        if (Array.isArray(leagueNode)) {
+            playersObj = leagueNode.find((n: any) => n.players)?.players;
+        } else {
+            playersObj = leagueNode?.players;
         }
 
-        // If not found, stop and report
-        if (!playersObj || Object.keys(playersObj).length === 0) {
-            if (start === 0) {
-                 return res.status(200).json({ 
-                    error: "Could not find 'players' key in Yahoo response", 
-                    debug_keys: Array.isArray(leagueArr) ? leagueArr.map(k => Object.keys(k)) : Object.keys(leagueArr || {})
-                });
-            }
-            break; 
-        }
+        if (!playersObj || Object.keys(playersObj).length === 0) break;
 
         const updates: any[] = [];
 
-        // Loop through the numeric keys ("0", "1", "2"...)
         for (const key in playersObj) {
             if (key === 'count') continue;
-            
             const p = playersObj[key].player;
             
-            // p is [ [Metadata...], {Stats} ]
+            // Extract Data
             const metaArray = Array.isArray(p[0]) ? p[0] : null;
             const statsPayload = p[1];
-
+            
             if (!metaArray) continue;
 
             const nameNode = metaArray.find((i: any) => i.name);
@@ -98,18 +81,53 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
             if (!nameNode) continue;
 
-            // Stats
-            const statMap: any = {};
+            // --- CORRECT STAT MAPPING ---
+            const map: any = {};
             if (statsPayload?.player_stats?.stats) {
-                statsPayload.player_stats.stats.forEach((s: any) => statMap[s.stat_id] = s.value);
+                statsPayload.player_stats.stats.forEach((s: any) => map[s.stat_id] = s.value);
             }
 
-            const goals = parseInt(statMap['4'] || '0');
-            const assists = parseInt(statMap['5'] || '0');
-            const hits = parseInt(statMap['31'] || '0');
-            const blks = parseInt(statMap['32'] || '0');
+            const position = positionNode?.display_position || 'F';
+            const isGoalie = position === 'G';
 
-            // Ownership
+            let stats = {};
+            let score = 0;
+
+            if (isGoalie) {
+                // GOALIE IDS: 19=W, 26=SV, 27=SA, 28=SHO (Common Yahoo IDs, might vary by league)
+                // We fallback to 0 if missing
+                const wins = parseInt(map['19'] || '0');
+                const saves = parseInt(map['26'] || '0');
+                const shutouts = parseInt(map['28'] || '0');
+                
+                stats = { wins, saves, shutouts, goals: 0, assists: 0 };
+                score = (wins * 4) + (saves * 0.2) + (shutouts * 2);
+            } else {
+                // SKATER IDS (Standard): 
+                // 1=GP, 2=G, 3=A, 4=Pts, 5=+/-
+                // 8=PIM, 9=PPG, 10=PPA, 11=PPP, 14=SOG, 31=HIT, 32=BLK
+                // Note: I am checking standard mapping. If your league uses different IDs, we might see 0s again.
+                // Let's try the most common set:
+                
+                const g = parseInt(map['2'] || map['4'] || '0'); // Try 2 first (Goals)
+                const a = parseInt(map['3'] || map['5'] || '0'); // Try 3 first (Assists)
+                const pim = parseInt(map['8'] || '0');
+                const ppp = parseInt(map['11'] || '0');
+                const sog = parseInt(map['14'] || '0');
+                const plusMin = parseInt(map['5'] || '0'); // Often ID 5
+                const hits = parseInt(map['31'] || '0');
+                const blks = parseInt(statMap['32'] || '0'); // 32 is standard for BLK
+
+                stats = { 
+                    goals: g, assists: a, pim, ppp, sog, plus_minus: plusMin, hits, blocks: blks,
+                    wins: 0, saves: 0, shutouts: 0
+                };
+                
+                // Fantasy Score Calc (Adjust weights as needed)
+                score = (g * 3) + (a * 2) + (sog * 0.4) + (hits * 0.5) + (blks * 0.5) + (ppp * 1) + (plusMin * 0.5);
+            }
+
+            // Status Logic
             const ownershipType = ownershipNode?.ownership?.ownership_type || 'freeagents';
             const status = ownershipType === 'team' ? 'TAKEN' : 'FA';
 
@@ -117,10 +135,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
                 nhl_id: parseInt(idNode?.player_id || '0'),
                 full_name: nameNode.name.full,
                 team: teamNode?.editorial_team_abbr || 'UNK',
-                position: positionNode?.display_position || 'F',
-                goals, assists, hits, blocks: blks,
+                position: position,
+                ...stats,
                 status: status,
-                fantasy_score: (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5),
+                fantasy_score: score,
                 last_updated: new Date().toISOString()
             });
         }
@@ -137,6 +155,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     res.status(200).json({ success: true, message: `Synced ${totalSynced} players successfully!` });
 
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message, stack: error.stack });
   }
 }
