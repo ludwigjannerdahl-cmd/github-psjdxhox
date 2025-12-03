@@ -97,32 +97,39 @@ export default function NordicTable() {
                   <tr>
                     <td colSpan={13} className="p-20 text-center">
                       <div className="text-slate-400 text-lg">🔄 Syncing Yahoo data...</div>
-                    </div>
-                  </td>
+                    </td>
+                  </tr>
                 ) : filtered.length === 0 ? (
                   <tr>
                     <td colSpan={13} className="p-20 text-center text-slate-400">
-                      No players found. <button onClick={fetchPlayers} className="underline hover:no-underline">Retry sync</button>
+                      No players found.{" "}
+                      <button onClick={fetchPlayers} className="underline hover:no-underline">
+                        Retry sync
+                      </button>
                     </td>
                   </tr>
                 ) : (
-                  filtered.map((p: any, index: number) => (
+                  filtered.map((p: any) => (
                     <tr key={p.nhl_id} className="hover:bg-slate-50/50 transition-all group">
                       <td className="p-6 font-semibold text-slate-900 group-hover:text-blue-600">
                         {p.full_name}
                       </td>
-                      <td className="p-4 text-center text-sm font-mono text-slate-700 uppercase">{p.position}</td>
+                      <td className="p-4 text-center text-sm font-mono text-slate-700 uppercase">
+                        {p.position}
+                      </td>
                       <td className="p-4 text-center">
                         <span className="w-6 h-6 bg-slate-200 rounded-full text-xs font-bold flex items-center justify-center text-slate-600">
                           {p.team}
                         </span>
                       </td>
                       <td className="p-4 text-center">
-                        <span className={`px-3 py-1 rounded-full text-xs font-bold ${
-                          p.status === 'FA'
-                            ? 'bg-gradient-to-r from-emerald-400 to-emerald-500 text-white shadow-lg'
-                            : 'bg-slate-200 text-slate-700'
-                        }`}>
+                        <span
+                          className={`px-3 py-1 rounded-full text-xs font-bold ${
+                            p.status === 'FA'
+                              ? 'bg-gradient-to-r from-emerald-400 to-emerald-500 text-white shadow-lg'
+                              : 'bg-slate-200 text-slate-700'
+                          }`}
+                        >
                           {p.status}
                         </span>
                       </td>
@@ -137,7 +144,15 @@ export default function NordicTable() {
                       <td className={`p-3 text-right font-mono text-lg font-bold text-blue-600 ${p.assists === 0 ? 'opacity-30' : ''}`}>
                         {p.assists}
                       </td>
-                      <td className={`p-3 text-right font-mono text-lg ${p.plus_minus > 0 ? 'text-emerald-600 font-bold' : p.plus_minus < 0 ? 'text-red-600 font-bold' : 'text-slate-500'}`}>
+                      <td
+                        className={`p-3 text-right font-mono text-lg ${
+                          p.plus_minus > 0
+                            ? 'text-emerald-600 font-bold'
+                            : p.plus_minus < 0
+                            ? 'text-red-600 font-bold'
+                            : 'text-slate-500'
+                        }`}
+                      >
                         {p.plus_minus}
                       </td>
                       <td className={`p-3 text-right font-mono text-sm ${p.pim > 0 ? 'text-orange-600' : 'text-slate-400'}`}>
@@ -165,11 +180,18 @@ export default function NordicTable() {
 
         <div className="mt-8 p-6 bg-slate-50 rounded-xl border border-slate-200">
           <div className="text-center text-sm text-slate-500">
-            <p>💾 <strong>{players.length}</strong> total players | 
-            <button onClick={fetchPlayers} className="ml-1 underline hover:no-underline text-blue-600 font-medium">
-              Refresh Data
-            </button></p>
-            <p className="mt-1">🔄 Last sync: <span id="lastSync"></span></p>
+            <p>
+              💾 <strong>{players.length}</strong> total players |
+              <button
+                onClick={fetchPlayers}
+                className="ml-1 underline hover:no-underline text-blue-600 font-medium"
+              >
+                Refresh Data
+              </button>
+            </p>
+            <p className="mt-1">
+              🔄 Last sync: <span id="lastSync"></span>
+            </p>
           </div>
         </div>
       </div>
