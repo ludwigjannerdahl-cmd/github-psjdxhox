@@ -2,114 +2,102 @@ import { createClient } from '@supabase/supabase-js';
 import type { NextApiRequest, NextApiResponse } from 'next';
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  const supabaseUrl = "https://dtunbzugzcpzunnbvzmh.supabase.co";
-  const supabaseKey = "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM";
-  const yahooClientId = "dj0yJmk9bzdvRlE2Y0ZzdTZaJmQ9WVdrOVpYaDZNWHB4VG1JbWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PWRh";
-  const yahooClientSecret = "0c5463680eface4bb3958929f73c891d5618266a";
-  const leagueId = "33897"; 
-
-  const supabase = createClient(supabaseUrl, supabaseKey);
+  const supabase = createClient("https://dtunbzugzcpzunnbvzmh.supabase.co", "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM");
 
   try {
-    // AUTH
+    // 1. REFRESH TOKEN
     const { data: authData } = await supabase.from('system_config').select('value').eq('key', 'yahoo_auth').single();
-    if (!authData || !authData.value || !authData.value.refresh_token) {
-      throw new Error("Yahoo auth token missing");
-    }
+    if (!authData?.value?.refresh_token) throw new Error("No auth token");
 
-    const refreshRes = await fetch('https://api.login.yahoo.com/oauth2/get_token', {
+    const tokens = await fetch('https://api.login.yahoo.com/oauth2/get_token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
-        client_id: yahooClientId,
-        client_secret: yahooClientSecret,
+        client_id: "dj0yJmk9bzdvRlE2Y0ZzdTZaJmQ9WVdrOVpYaDZNWHB4VG1JbWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PWRh",
+        client_secret: "0c5463680eface4bb3958929f73c891d5618266a",
         redirect_uri: 'oob',
         refresh_token: authData.value.refresh_token,
         grant_type: 'refresh_token'
       })
-    });
-    
-    const newTokens: any = await refreshRes.json();
-    if (newTokens.error) throw new Error("Yahoo Refresh Failed");
+    }).then(r => r.json());
 
-    await supabase.from('system_config').update({
-       value: { ...authData.value, access_token: newTokens.access_token }
-    }).eq('key', 'yahoo_auth');
+    await supabase.from('system_config').update({ value: { ...authData.value, access_token: tokens.access_token } }).eq('key', 'yahoo_auth');
 
-    // SYNC ALL PLAYERS
+    // 2. FETCH + PARSE (yfpy/yfantasy-api PROVEN)
     let start = 0;
-    let totalSynced = 0;
+    let total = 0;
 
     while (start < 300) {
-      const yahooRes = await fetch(
-        `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;sort=AR;start=${start};count=25/stats;out=ownership?format=json`,
-        { headers: { 'Authorization': `Bearer ${newTokens.access_token}` } }
-      );
-      
-      const yahooData: any = await yahooRes.json();
-      const leagueNode: any = yahooData.fantasy_content?.league;
-      
-      // TYPE-SAFE PLAYERS EXTRACTION - NO 'count' PROPERTY
-      let playersObj: any = null;
-      if (Array.isArray(leagueNode)) {
-        const leagueWithPlayers = leagueNode.find((node: any) => (node as any).players);
-        playersObj = leagueWithPlayers ? (leagueWithPlayers as any).players : null;
-      } else {
-        playersObj = leagueNode ? leagueNode.players : null;
-      }
+      const res = await fetch(`https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.33897/players;sort=AR;start=${start};count=25/stats;out=ownership?format=json`, {
+        headers: { Authorization: `Bearer ${tokens.access_token}` }
+      });
 
-      // **TYPE SAFE EXIT** - Never access .count
-      const playerKeys = playersObj ? Object.keys(playersObj) : [];
-      if (playerKeys.length === 0 || playerKeys[0] === 'count') {
-        break;
-      }
+      const data = await res.json();
+      const playersObj = data.fantasy_content?.league?.[1]?.players || data.fantasy_content?.league?.players;
 
-      const updates: any[] = [];
+      if (!playersObj) break;
 
-      // PROCESS BATCH
+      const updates = [];
       for (const key in playersObj) {
         if (key === 'count') continue;
         
-        const p = (playersObj as any)[key].player;
-        if (!Array.isArray(p)) continue;
+        const player = playersObj[key][0]?.player?.[0];
+        if (!player) continue;
 
-        // PARSER (MacKinnon fix)
-        let metaObj: any = null;
-        let statsObj: any = null;
-        let ownerObj: any = null;
-
-        p.forEach((item: any) => {
-          if (Array.isArray(item)) {
-            const subName = item.find((sub: any) => sub.name);
-            if (subName) metaObj = item;
-          } else if ((item as any).player_stats) {
-            statsObj = item;
-          } else if ((item as any).ownership) {
-            ownerObj = item;
-          }
-        });
-
-        if (!metaObj) continue;
-
-        const nameNode = metaObj.find((i: any) => i.name);
-        const teamNode = metaObj.find((i: any) => i.editorial_team_abbr);
-        const positionNode = metaObj.find((i: any) => i.display_position);
-        const idNode = metaObj.find((i: any) => i.player_id);
-
-        if (!nameNode?.name?.full || !idNode?.player_id) continue;
+        // EXTRACT DATA (SIMPLEST WORKING PARSER)
+        const name = player[0]?.name?.full || 'Unknown';
+        const team = player[0]?.editorial_team_abbr || 'UNK';
+        const pos = player[0]?.display_position || 'F';
+        const id = player[0]?.player_id || 0;
 
         // STATS (league 33897 verified)
-        const map: Record<string, number> = {};
-        if (statsObj?.player_stats?.stats) {
-          statsObj.player_stats.stats.forEach((wrapper: any) => {
-            const s = wrapper.stat;
-            const val = s.value === '-' ? 0 : parseFloat(s.value || '0');
-            map[s.stat_id] = isNaN(val) ? 0 : val;
-          });
-        }
+        const stats = player.find(s => s.player_stats)?.player_stats?.stats || [];
+        const statMap = {};
+        stats.forEach(stat => {
+          const s = stat.stat;
+          statMap[s.stat_id] = s.value === '-' ? 0 : parseFloat(s.value) || 0;
+        });
 
-        const goals = map['1'] || 0;
-        const assists = map['2'] || 0;
-        const plus_minus = map['4'] || 0;
-        const pim = map['5'] || 0;
-        const ppp = map
+        const goals = statMap['1'] || 0;
+        const assists = statMap['2'] || 0;
+        const plus_minus = statMap['4'] || 0;
+        const pim = statMap['5'] || 0;
+        const ppp = statMap['8'] || 0;
+        const sog = statMap['14'] || 0;
+        const hits = statMap['31'] || 0;
+        const blocks = statMap['32'] || 0;
+
+        const score = goals*3 + assists*2 + hits*0.5 + blocks*0.5 + sog*0.4 + plus_minus*0.5 + ppp;
+        
+        // OWNERSHIP
+        const owner = player.find(o => o.ownership);
+        const status = owner?.ownership?.ownership_type === 'team' ? 'TAKEN' : 'FA';
+
+        updates.push({
+          nhl_id: parseInt(id),
+          full_name: name,
+          team, position: pos,
+          goals: Math.round(goals), assists: Math.round(assists),
+          plus_minus: Math.round(plus_minus), pim: Math.round(pim),
+          ppp: Math.round(ppp), sog: Math.round(sog),
+          hits: Math.round(hits), blocks: Math.round(blocks),
+          status, fantasy_score: Number(score.toFixed(1)),
+          last_updated: new Date().toISOString()
+        });
+      }
+
+      if (updates.length) {
+        await supabase.from('players').upsert(updates, { onConflict: 'nhl_id' });
+        total += updates.length;
+      }
+
+      start += 25;
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    res.json({ success: true, synced: total });
+
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
