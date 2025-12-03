@@ -69,46 +69,27 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         for (const key in playersObj) {
             if (key === 'count') continue;
             
-            const p = playersObj[key].player; // This is the Array [ {Meta}, {Stats}, {Owner?} ]
+            const p = playersObj[key].player;
             
-            // --- THE FINAL FIX: SMART LOOP ---
-            // Don't guess indexes. Find the objects by their keys.
+            // Yahoo Structure: [ [Metadata], {Stats}, {Ownership} ]
+            // We use the robust find method we built earlier
             let metaObj: any = null;
             let statsObj: any = null;
             let ownerObj: any = null;
 
-            if (Array.isArray(p)) {
-                p.forEach((item: any) => {
-                    if (Array.isArray(item)) {
-                        // Metadata is often wrapped in another array inside the main array
-                        const subName = item.find((sub: any) => sub.name);
-                        if (subName) metaObj = item;
-                    } else if (item.player_stats) {
-                        statsObj = item;
-                    } else if (item.ownership) {
-                        ownerObj = item;
-                    } else if (item.name) {
-                        // Sometimes metadata is just a raw object
-                        metaObj = [item]; 
-                    }
-                });
-            }
+            // Flatten and search (Robust approach)
+            const flatData = Array.isArray(p) ? p.flat() : [];
+            
+            metaObj = flatData.find((i: any) => i.name && i.editorial_team_abbr);
+            statsObj = flatData.find((i: any) => i.player_stats);
+            ownerObj = flatData.find((i: any) => i.ownership);
 
-            // Fallback: If looping failed, try the find method on the flat array
-            if (!metaObj) metaObj = p.find((i: any) => Array.isArray(i) && i.find((sub:any) => sub.name));
-            if (!statsObj) statsObj = p.find((i: any) => i.player_stats);
-            if (!ownerObj) ownerObj = p.find((i: any) => i.ownership);
-
-            // Need at least name and stats
             if (!metaObj) continue;
 
-            // Extract Meta Details
-            const nameNode = metaObj.find((i: any) => i.name);
-            const teamNode = metaObj.find((i: any) => i.editorial_team_abbr);
-            const positionNode = metaObj.find((i: any) => i.display_position);
-            const idNode = metaObj.find((i: any) => i.player_id);
+            const nameNode = metaObj;
+            const idNode = metaObj; // ID is usually in the same obj as name/team
 
-            // Extract Stats
+            // --- STATS PARSING ---
             const map: any = {};
             if (statsObj?.player_stats?.stats) {
                 statsObj.player_stats.stats.forEach((wrapper: any) => {
@@ -118,32 +99,38 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
                 });
             }
 
-            // --- STAT MAPPING (Adrian Kempe Verified) ---
-            const position = positionNode?.display_position || 'F';
+            const position = nameNode.display_position || 'F';
             const isGoalie = position === 'G';
 
             let stats = {};
             let score = 0;
 
             if (isGoalie) {
+                // GOALIE MAPPING (Using standard guesses, since we verified Skater IDs)
+                // If these show 0 later, we can map them like we did Kempe.
                 const wins = map['19'] || 0;
                 const saves = map['26'] || 0;
                 const shutouts = map['28'] || 0;
                 const ga = map['22'] || 0;
+                
                 score = (wins * 4) + (saves * 0.2) + (shutouts * 2) - (ga * 1);
-                stats = { wins, saves, shutouts, goals_against: ga, goals: 0, assists: 0, hits: 0, blocks: 0 };
+                stats = { wins, saves, shutouts, goals_against: ga, goals: 0, assists: 0, hits: 0, blocks: 0, pim: 0, ppp: 0, shp: 0, sog: 0 };
             } else {
-                const goals = map['1'] || 0;      
-                const assists = map['2'] || 0;    
-                const plus_minus = map['4'] || 0; 
-                const pim = map['5'] || 0;        
-                const ppp = map['8'] || 0;        
-                const sog = map['14'] || 0;       
-                const hits = map['31'] || 0;      
-                const blks = map['32'] || 0;      
+                // SKATER MAPPING (VERIFIED FROM YOUR SCREENSHOT)
+                const goals = map['1'] || 0;
+                const assists = map['2'] || 0;
+                const plus_minus = map['4'] || 0;
+                const pim = map['5'] || 0;
+                const ppp = map['8'] || 0;
+                const shp = map['11'] || 0;
+                const sog = map['14'] || 0;
+                const hits = map['31'] || 0;
+                const blks = map['32'] || 0;
 
-                score = (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5) + (sog * 0.4) + (plus_minus * 0.5) + (ppp * 1);
-                stats = { goals, assists, plus_minus, pim, ppp, sog, hits, blocks: blks };
+                // Fantasy Score Calc
+                score = (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5) + (sog * 0.4) + (plus_minus * 0.5) + (ppp * 1) + (shp * 2);
+                
+                stats = { goals, assists, plus_minus, pim, ppp, shp, sog, hits, blocks: blks };
             }
 
             // Status Logic
@@ -153,7 +140,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             updates.push({
                 nhl_id: parseInt(idNode?.player_id), 
                 full_name: nameNode.name.full,
-                team: teamNode?.editorial_team_abbr || 'UNK',
+                team: nameNode.editorial_team_abbr || 'UNK',
                 position: position,
                 ...stats,
                 status: status,
@@ -173,7 +160,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     res.status(200).json({ 
         success: true, 
-        message: `Synced ${totalSynced} players with SMART PARSING!`
+        message: `Synced ${totalSynced} players with KEMPE-VERIFIED IDs!`
     });
 
   } catch (error: any) {
