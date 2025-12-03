@@ -3,7 +3,7 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   
-  // --- KONFIGURATION ---
+  // --- CONFIGURATION ---
   const supabaseUrl = "https://dtunbzugzcpzunnbvzmh.supabase.co";
   const supabaseKey = "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM";
   
@@ -15,11 +15,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
-    // 1. Hämta Token
+    // 1. Auth & Refresh
     const { data: authData } = await supabase.from('system_config').select('value').eq('key', 'yahoo_auth').single();
     if (!authData) throw new Error("Auth token missing.");
 
-    // 2. Uppdatera Token hos Yahoo
     const refreshRes = await fetch('https://api.login.yahoo.com/oauth2/get_token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -39,7 +38,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
        value: { ...authData.value, access_token: newTokens.access_token }
     }).eq('key', 'yahoo_auth');
 
-    // 3. HÄMTA SPELARE (Loop för 300 st)
+    // 2. FETCH LOOP
     let start = 0;
     const maxPlayers = 300; 
     let totalSynced = 0;
@@ -52,10 +51,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         );
         
         const yahooData = await yahooRes.json();
-        const leagueNode = yahooData.fantasy_content?.league;
         
-        // Hitta var spelarna ligger (Smart Search)
+        // --- PARSER ---
+        const leagueNode = yahooData.fantasy_content?.league;
         let playersObj: any = null;
+        
         if (Array.isArray(leagueNode)) {
             playersObj = leagueNode.find((n: any) => n.players)?.players;
         } else {
@@ -71,16 +71,22 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             
             const p = playersObj[key].player;
             
-            // Platta ut strukturen för att hitta data oavsett var Yahoo gömmer den
+            // Yahoo Structure: [ [Meta1, Meta2...], {Stats}, {Ownership} ]
+            // We flatten the first array to search it easily
             const flatData = Array.isArray(p) ? p.flat() : [];
             
-            const nameNode = flatData.find((i: any) => i.name && i.editorial_team_abbr);
-            const statsObj = flatData.find((i: any) => i.player_stats);
-            const ownerObj = flatData.find((i: any) => i.ownership);
+            // --- THE FIX: SEARCH SEPARATELY ---
+            const nameNode = flatData.find((i: any) => i.name);
+            const teamNode = flatData.find((i: any) => i.editorial_team_abbr);
+            const idNode = flatData.find((i: any) => i.player_id);
+            
+            // These might be in the second/third array elements, so we search the top level p array too
+            const statsObj = p.find((i: any) => i.player_stats);
+            const ownerObj = p.find((i: any) => i.ownership);
 
-            if (!nameNode) continue;
+            if (!nameNode) continue; // Must have a name
 
-            // --- HÄR ÄR FIXEN: KARTLÄGG RÄTT ID-NUMMER ---
+            // --- STATS PARSING ---
             const map: any = {};
             if (statsObj?.player_stats?.stats) {
                 statsObj.player_stats.stats.forEach((wrapper: any) => {
@@ -97,40 +103,39 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             let score = 0;
 
             if (isGoalie) {
-                // Målvakts-IDn (Gissning baserat på standard, justera om de är 0)
+                // GOALIE MAPPING (Standard)
                 const wins = map['19'] || 0;
                 const saves = map['26'] || 0;
                 const shutouts = map['28'] || 0;
-                const ga = map['22'] || 0; // Goals Against
+                const ga = map['22'] || 0;
                 
                 score = (wins * 4) + (saves * 0.2) + (shutouts * 2) - (ga * 1);
                 stats = { wins, saves, shutouts, goals_against: ga, goals: 0, assists: 0, hits: 0, blocks: 0, pim: 0, ppp: 0, shp: 0, sog: 0 };
             } else {
-                // UTESPELARE (Baserat på din skärmdump av Kempe)
-                const goals = map['1'] || 0;      // <--- RÄTT ID
-                const assists = map['2'] || 0;    // <--- RÄTT ID
-                const plus_minus = map['4'] || 0; 
-                const pim = map['5'] || 0;        
-                const ppp = map['8'] || 0;        
+                // SKATER MAPPING (KEMPE VERIFIED)
+                const goals = map['1'] || 0;
+                const assists = map['2'] || 0;
+                const plus_minus = map['4'] || 0;
+                const pim = map['5'] || 0;
+                const ppp = map['8'] || 0;
                 const shp = map['11'] || 0;
-                const sog = map['14'] || 0;       
-                const hits = map['31'] || 0;      
-                const blks = map['32'] || 0;      
+                const sog = map['14'] || 0;
+                const hits = map['31'] || 0;
+                const blks = map['32'] || 0;
 
-                // Poängberäkning
                 score = (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5) + (sog * 0.4) + (plus_minus * 0.5) + (ppp * 1) + (shp * 2);
                 
                 stats = { goals, assists, plus_minus, pim, ppp, shp, sog, hits, blocks: blks };
             }
 
-            // Status: FA eller TAKEN
+            // Status Logic
             const ownershipType = ownerObj?.ownership?.ownership_type || 'freeagents';
             const status = ownershipType === 'team' ? 'TAKEN' : 'FA';
 
             updates.push({
-                nhl_id: parseInt(nameNode.player_id), 
+                nhl_id: parseInt(idNode?.player_id), 
                 full_name: nameNode.name.full,
-                team: nameNode.editorial_team_abbr || 'UNK',
+                team: teamNode?.editorial_team_abbr || 'UNK',
                 position: position,
                 ...stats,
                 status: status,
@@ -148,10 +153,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         await new Promise(r => setTimeout(r, 500)); 
     }
 
-    // Det här meddelandet bekräftar att du kör RÄTT version
     res.status(200).json({ 
         success: true, 
-        message: `Synced ${totalSynced} players with KEMPE-VERIFIED IDs!`
+        message: `Synced ${totalSynced} players with FIXED PARSING!`
     });
 
   } catch (error: any) {
