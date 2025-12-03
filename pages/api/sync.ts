@@ -42,7 +42,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     let start = 0;
     const maxPlayers = 300; 
     let totalSynced = 0;
-    let debugSample = {};
 
     while (start < maxPlayers) {
         
@@ -57,7 +56,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         const leagueNode = yahooData.fantasy_content?.league;
         let playersObj: any = null;
         
-        // Find players array - robust search
         if (Array.isArray(leagueNode)) {
             playersObj = leagueNode.find((n: any) => n.players)?.players;
         } else {
@@ -71,40 +69,56 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         for (const key in playersObj) {
             if (key === 'count') continue;
             
-            const p = playersObj[key].player;
+            const p = playersObj[key].player; // This is the Array [ {Meta}, {Stats}, {Owner?} ]
             
-            // Yahoo Structure: [ [Metadata], {Stats}, {Ownership} ]
-            const metaArray = Array.isArray(p[0]) ? p[0] : null;
-            const statsPayload = p[1]; // The object containing player_stats
+            // --- THE FINAL FIX: SMART LOOP ---
+            // Don't guess indexes. Find the objects by their keys.
+            let metaObj: any = null;
+            let statsObj: any = null;
+            let ownerObj: any = null;
 
-            if (!metaArray) continue;
+            if (Array.isArray(p)) {
+                p.forEach((item: any) => {
+                    if (Array.isArray(item)) {
+                        // Metadata is often wrapped in another array inside the main array
+                        const subName = item.find((sub: any) => sub.name);
+                        if (subName) metaObj = item;
+                    } else if (item.player_stats) {
+                        statsObj = item;
+                    } else if (item.ownership) {
+                        ownerObj = item;
+                    } else if (item.name) {
+                        // Sometimes metadata is just a raw object
+                        metaObj = [item]; 
+                    }
+                });
+            }
 
-            const nameNode = metaArray.find((i: any) => i.name);
-            const teamNode = metaArray.find((i: any) => i.editorial_team_abbr);
-            const positionNode = metaArray.find((i: any) => i.display_position);
-            const ownershipNode = metaArray.find((i: any) => i.ownership);
-            const idNode = metaArray.find((i: any) => i.player_id);
+            // Fallback: If looping failed, try the find method on the flat array
+            if (!metaObj) metaObj = p.find((i: any) => Array.isArray(i) && i.find((sub:any) => sub.name));
+            if (!statsObj) statsObj = p.find((i: any) => i.player_stats);
+            if (!ownerObj) ownerObj = p.find((i: any) => i.ownership);
 
-            if (!nameNode) continue;
+            // Need at least name and stats
+            if (!metaObj) continue;
 
-            // --- STATS PARSING FIX ---
+            // Extract Meta Details
+            const nameNode = metaObj.find((i: any) => i.name);
+            const teamNode = metaObj.find((i: any) => i.editorial_team_abbr);
+            const positionNode = metaObj.find((i: any) => i.display_position);
+            const idNode = metaObj.find((i: any) => i.player_id);
+
+            // Extract Stats
             const map: any = {};
-            if (statsPayload?.player_stats?.stats) {
-                statsPayload.player_stats.stats.forEach((wrapper: any) => {
-                    // CRITICAL FIX: Unwrap the 'stat' object
+            if (statsObj?.player_stats?.stats) {
+                statsObj.player_stats.stats.forEach((wrapper: any) => {
                     const s = wrapper.stat; 
                     const val = s.value === '-' ? 0 : parseFloat(s.value);
                     map[s.stat_id] = isNaN(val) ? 0 : val;
                 });
             }
 
-            // Debug the first player's stats to verify mapping
-            if (totalSynced === 0) debugSample = { name: nameNode.name.full, stats: map };
-
-            // MAP IDS (Standard Yahoo NHL):
-            // 2=Goals, 3=Assists, 4=+/-, 5=PIM, 8=PPP, 14=SOG, 31=HIT, 32=BLK
-            // GOALIES: 19=Wins, 26=Saves, 27=Save%, 28=Shutouts
-            
+            // --- STAT MAPPING (Adrian Kempe Verified) ---
             const position = positionNode?.display_position || 'F';
             const isGoalie = position === 'G';
 
@@ -115,26 +129,25 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
                 const wins = map['19'] || 0;
                 const saves = map['26'] || 0;
                 const shutouts = map['28'] || 0;
-                // Assuming standard goalie scoring: Win(4) + Save(0.2) + Shutout(2) - GA(1)
-                score = (wins * 4) + (saves * 0.2) + (shutouts * 2);
-                stats = { wins, saves, shutouts, goals: 0, assists: 0, hits: 0, blocks: 0 };
+                const ga = map['22'] || 0;
+                score = (wins * 4) + (saves * 0.2) + (shutouts * 2) - (ga * 1);
+                stats = { wins, saves, shutouts, goals_against: ga, goals: 0, assists: 0, hits: 0, blocks: 0 };
             } else {
-                const goals = map['2'] || 0; 
-                const assists = map['3'] || 0; 
-                const plus_minus = map['4'] || 0;
-                const pim = map['5'] || 0;
-                const ppp = map['8'] || 0;
-                const sog = map['14'] || 0;
-                const hits = map['31'] || 0;
-                const blks = map['32'] || 0;
+                const goals = map['1'] || 0;      
+                const assists = map['2'] || 0;    
+                const plus_minus = map['4'] || 0; 
+                const pim = map['5'] || 0;        
+                const ppp = map['8'] || 0;        
+                const sog = map['14'] || 0;       
+                const hits = map['31'] || 0;      
+                const blks = map['32'] || 0;      
 
-                // Fantasy Score
-                score = (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5) + (sog * 0.4) + (plus_minus * 0.5);
+                score = (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5) + (sog * 0.4) + (plus_minus * 0.5) + (ppp * 1);
                 stats = { goals, assists, plus_minus, pim, ppp, sog, hits, blocks: blks };
             }
 
             // Status Logic
-            const ownershipType = ownershipNode?.ownership?.ownership_type || 'freeagents';
+            const ownershipType = ownerObj?.ownership?.ownership_type || 'freeagents';
             const status = ownershipType === 'team' ? 'TAKEN' : 'FA';
 
             updates.push({
@@ -160,8 +173,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     res.status(200).json({ 
         success: true, 
-        message: `Synced ${totalSynced} players.`,
-        debug_check: debugSample // Check this in browser to verify IDs
+        message: `Synced ${totalSynced} players with SMART PARSING!`
     });
 
   } catch (error: any) {
