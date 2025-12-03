@@ -1,7 +1,7 @@
 "use client";
-import { useEffect, useState } from 'react';
-import { createClient } from '@supabase/supabase-js';
-import { Search, RotateCw } from 'lucide-react';
+import { useEffect, useMemo, useState } from "react";
+import { createClient } from "@supabase/supabase-js";
+import { Search, RotateCw, SlidersHorizontal } from "lucide-react";
 
 const supabaseUrl = "https://dtunbzugzcpzunnbvzmh.supabase.co";
 const supabaseKey =
@@ -9,11 +9,97 @@ const supabaseKey =
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+type Player = {
+  nhl_id: number;
+  full_name: string;
+  team: string;
+  position: string;
+  status: string;
+  goals: number;
+  assists: number;
+  plus_minus: number;
+  pim: number;
+  ppp: number;
+  sog: number;
+  hits: number;
+  blocks: number;
+  fantasy_score: number;
+};
+
+type Percentiles = {
+  [nhl_id: number]: {
+    goals: number;
+    assists: number;
+    pim: number;
+    ppp: number;
+    sog: number;
+    hits: number;
+    blocks: number;
+    fantasy_score: number;
+  };
+};
+
+function buildPercentiles(players: Player[]): Percentiles {
+  const keys: (keyof Percentiles[number])[] = [
+    "goals",
+    "assists",
+    "pim",
+    "ppp",
+    "sog",
+    "hits",
+    "blocks",
+    "fantasy_score",
+  ];
+
+  const values: { [K in keyof Percentiles[number]]: number[] } = {
+    goals: [],
+    assists: [],
+    pim: [],
+    ppp: [],
+    sog: [],
+    hits: [],
+    blocks: [],
+    fantasy_score: [],
+  };
+
+  players.forEach((p) => {
+    values.goals.push(p.goals || 0);
+    values.assists.push(p.assists || 0);
+    values.pim.push(p.pim || 0);
+    values.ppp.push(p.ppp || 0);
+    values.sog.push(p.sog || 0);
+    values.hits.push(p.hits || 0);
+    values.blocks.push(p.blocks || 0);
+    values.fantasy_score.push(p.fantasy_score || 0);
+  });
+
+  keys.forEach((k) => values[k].sort((a, b) => a - b));
+
+  const pct: Percentiles = {};
+  const n = players.length || 1;
+
+  players.forEach((p) => {
+    const entry: any = {};
+    keys.forEach((k) => {
+      const arr = values[k];
+      const v = (p as any)[k] || 0;
+      let rankIndex = arr.findIndex((x) => x >= v);
+      if (rankIndex === -1) rankIndex = arr.length - 1;
+      const percentile = Math.round((rankIndex / (n - 1 || 1)) * 100);
+      entry[k] = percentile;
+    });
+    pct[p.nhl_id] = entry;
+  });
+
+  return pct;
+}
+
 export default function NordicTable() {
-  const [players, setPlayers] = useState<any[]>([]);
+  const [players, setPlayers] = useState<Player[]>([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState<"ALL" | "FA">("ALL");
   const [search, setSearch] = useState("");
+  const [tab, setTab] = useState<"overview" | "advanced">("overview");
 
   useEffect(() => {
     fetchPlayers();
@@ -25,119 +111,202 @@ export default function NordicTable() {
       .from("players")
       .select("*")
       .order("fantasy_score", { ascending: false })
-      .limit(200);
-    setPlayers(data || []);
+      .limit(350);
+
+    setPlayers((data || []) as Player[]);
     setLoading(false);
   }
 
-  const filtered = players.filter((p) => {
-    const matchesStatus = statusFilter === "ALL" || p.status === statusFilter;
-    const matchesSearch = p.full_name
-      .toLowerCase()
-      .includes(search.toLowerCase());
-    return matchesStatus && matchesSearch;
-  });
+  const filtered = useMemo(
+    () =>
+      players.filter((p) => {
+        const matchesStatus = statusFilter === "ALL" || p.status === statusFilter;
+        const matchesSearch = p.full_name
+          .toLowerCase()
+          .includes(search.toLowerCase());
+        return matchesStatus && matchesSearch;
+      }),
+    [players, statusFilter, search]
+  );
+
+  const percentiles = useMemo(() => buildPercentiles(players), [players]);
+
+  function renderStatCell(value: number, zeroDim = true) {
+    return (
+      <span
+        className={`font-mono text-sm text-slate-800 ${
+          zeroDim && value === 0 ? "opacity-30" : ""
+        }`}
+      >
+        {value}
+      </span>
+    );
+  }
+
+  function renderBar(pct: number) {
+    return (
+      <div className="w-full h-1.5 rounded-full bg-slate-100 overflow-hidden">
+        <div
+          className="h-full rounded-full bg-gradient-to-r from-emerald-400 via-sky-400 to-indigo-500"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+    );
+  }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 p-8">
-      <div className="max-w-7xl mx-auto">
-        <div className="flex justify-between items-center mb-8">
+    <main className="min-h-screen bg-gradient-to-br from-slate-50 via-slate-100 to-slate-50 px-4 py-8 sm:px-8">
+      <div className="max-w-6xl mx-auto space-y-6">
+        {/* Header */}
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
           <div>
-            <h1 className="text-4xl font-bold bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">
-              Nordic Scout
+            <h1 className="text-4xl sm:text-5xl font-semibold tracking-tight text-slate-900">
+              <span className="bg-gradient-to-r from-slate-900 via-slate-700 to-slate-900 bg-clip-text text-transparent">
+                Nordic Scout
+              </span>
             </h1>
-            <p className="text-slate-500 mt-1">Yahoo Fantasy Hockey - League 33897</p>
+            <p className="mt-1 text-sm text-slate-500">
+              Yahoo Fantasy Hockey • League 33897
+            </p>
           </div>
-          <div className="flex gap-3">
-            <div className="relative">
-              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-slate-400" />
+
+          <div className="flex flex-col sm:flex-row gap-3 sm:items-center">
+            <div className="relative w-full sm:w-64">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
               <input
                 placeholder="Search players..."
-                className="pl-10 pr-4 py-2 border border-slate-200 rounded-lg w-72 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                className="w-full pl-9 pr-3 py-2 rounded-full border border-slate-200 bg-white/80 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-slate-300"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
               />
             </div>
-            <button
-              onClick={() =>
-                setStatusFilter(statusFilter === "FA" ? "ALL" : "FA")
-              }
-              className={`px-6 py-2 rounded-lg font-medium transition-all ${
-                statusFilter === "FA"
-                  ? "bg-emerald-500 text-white shadow-lg hover:bg-emerald-600"
-                  : "bg-white border border-slate-200 hover:shadow-md text-slate-700"
-              }`}
-            >
-              {statusFilter === "FA" ? "All Players" : "Free Agents Only"}
-            </button>
+
+            <div className="inline-flex items-center rounded-full bg-slate-100 p-1">
+              <button
+                onClick={() => setStatusFilter("ALL")}
+                className={`px-3 py-1 text-xs font-medium rounded-full transition-colors ${
+                  statusFilter === "ALL"
+                    ? "bg-white shadow-sm text-slate-900"
+                    : "text-slate-500"
+                }`}
+              >
+                All
+              </button>
+              <button
+                onClick={() => setStatusFilter("FA")}
+                className={`px-3 py-1 text-xs font-medium rounded-full transition-colors ${
+                  statusFilter === "FA"
+                    ? "bg-emerald-500 text-white shadow-sm"
+                    : "text-slate-500"
+                }`}
+              >
+                Free agents
+              </button>
+            </div>
+
             <button
               onClick={fetchPlayers}
-              className="p-3 bg-slate-100 hover:bg-slate-200 rounded-xl transition-all shadow-sm"
+              className="inline-flex items-center justify-center rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-600 shadow-sm hover:bg-slate-50"
               disabled={loading}
             >
-              <RotateCw className={`w-5 h-5 ${loading ? "animate-spin" : ""}`} />
+              <RotateCw
+                className={`w-4 h-4 mr-1 ${
+                  loading ? "animate-spin text-slate-400" : "text-slate-500"
+                }`}
+              />
+              Refresh
             </button>
           </div>
         </div>
 
-        <div className="bg-white rounded-2xl shadow-xl border border-slate-200 overflow-hidden">
+        {/* Tabs */}
+        <div className="flex items-center justify-between">
+          <div className="inline-flex rounded-full bg-slate-100 p-1">
+            <button
+              onClick={() => setTab("overview")}
+              className={`px-4 py-1.5 text-xs font-medium rounded-full transition-colors ${
+                tab === "overview"
+                  ? "bg-white text-slate-900 shadow-sm"
+                  : "text-slate-500"
+              }`}
+            >
+              Overview
+            </button>
+            <button
+              onClick={() => setTab("advanced")}
+              className={`px-4 py-1.5 text-xs font-medium rounded-full transition-colors ${
+                tab === "advanced"
+                  ? "bg-white text-slate-900 shadow-sm"
+                  : "text-slate-500"
+              }`}
+            >
+              Advanced
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2 text-xs text-slate-500">
+            <SlidersHorizontal className="w-3 h-3" />
+            <span>
+              {tab === "overview"
+                ? "Simple scoring overview"
+                : "Percentiles based on all synced players"}
+            </span>
+          </div>
+        </div>
+
+        {/* Table */}
+        <div className="bg-white/90 backdrop-blur-sm border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
           <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead>
-                <tr className="bg-gradient-to-r from-slate-50 to-slate-100 border-b-2 border-slate-200">
-                  <th className="p-6 text-left font-bold text-slate-800 text-lg tracking-tight">
-                    PLAYER
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50/80 border-b border-slate-200">
+                <tr className="text-[11px] tracking-wide text-slate-500 uppercase">
+                  <th className="px-4 py-3 text-left font-semibold text-slate-600">
+                    Player
                   </th>
-                  <th className="p-4 text-center font-bold text-slate-600 text-sm uppercase tracking-wider w-16">
-                    POS
+                  <th className="px-2 py-3 text-center font-semibold">Pos</th>
+                  <th className="px-2 py-3 text-center font-semibold">Team</th>
+                  <th className="px-2 py-3 text-center font-semibold">Status</th>
+                  <th className="px-2 py-3 text-right font-semibold text-slate-700">
+                    Score
                   </th>
-                  <th className="p-4 text-center font-bold text-slate-600 text-sm uppercase tracking-wider w-16">
-                    TEAM
-                  </th>
-                  <th className="p-4 text-center font-bold text-slate-600 text-sm uppercase tracking-wider w-24">
-                    STATUS
-                  </th>
-                  <th className="p-4 text-right font-bold text-slate-800 text-xl w-24">
-                    SCORE
-                  </th>
-                  <th className="p-3 text-right font-bold text-slate-600 text-xs uppercase tracking-wider w-14">
-                    G
-                  </th>
-                  <th className="p-3 text-right font-bold text-slate-600 text-xs uppercase tracking-wider w-14">
-                    A
-                  </th>
-                  <th className="p-3 text-right font-bold text-slate-600 text-xs uppercase tracking-wider w-14">
-                    +/-
-                  </th>
-                  <th className="p-3 text-right font-bold text-slate-600 text-xs uppercase tracking-wider w-14">
-                    PIM
-                  </th>
-                  <th className="p-3 text-right font-bold text-slate-600 text-xs uppercase tracking-wider w-14">
-                    PPP
-                  </th>
-                  <th className="p-3 text-right font-bold text-slate-600 text-xs uppercase tracking-wider w-14">
-                    SOG
-                  </th>
-                  <th className="p-3 text-right font-bold text-slate-600 text-xs uppercase tracking-wider w-14">
-                    HIT
-                  </th>
-                  <th className="p-3 text-right font-bold text-slate-600 text-xs uppercase tracking-wider w-14">
-                    BLK
-                  </th>
+
+                  {tab === "overview" ? (
+                    <>
+                      <th className="px-2 py-3 text-right font-semibold">G</th>
+                      <th className="px-2 py-3 text-right font-semibold">A</th>
+                      <th className="px-2 py-3 text-right font-semibold">+/-</th>
+                      <th className="px-2 py-3 text-right font-semibold">PIM</th>
+                      <th className="px-2 py-3 text-right font-semibold">PPP</th>
+                      <th className="px-2 py-3 text-right font-semibold">SOG</th>
+                      <th className="px-2 py-3 text-right font-semibold">Hit</th>
+                      <th className="px-2 py-3 text-right font-semibold">Blk</th>
+                    </>
+                  ) : (
+                    <>
+                      <th className="px-3 py-3 text-left font-semibold">G pct</th>
+                      <th className="px-3 py-3 text-left font-semibold">A pct</th>
+                      <th className="px-3 py-3 text-left font-semibold">PIM pct</th>
+                      <th className="px-3 py-3 text-left font-semibold">PPP pct</th>
+                      <th className="px-3 py-3 text-left font-semibold">SOG pct</th>
+                      <th className="px-3 py-3 text-left font-semibold">Hit pct</th>
+                      <th className="px-3 py-3 text-left font-semibold">Blk pct</th>
+                      <th className="px-3 py-3 text-left font-semibold">
+                        Score pct
+                      </th>
+                    </>
+                  )}
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {loading ? (
                   <tr>
-                    <td colSpan={13} className="p-20 text-center">
-                      <div className="text-slate-400 text-lg">
-                        🔄 Syncing Yahoo data...
-                      </div>
+                    <td colSpan={13} className="py-10 text-center text-slate-400">
+                      Syncing Yahoo data…
                     </td>
                   </tr>
                 ) : filtered.length === 0 ? (
                   <tr>
-                    <td colSpan={13} className="p-20 text-center text-slate-400">
+                    <td colSpan={13} className="py-10 text-center text-slate-400">
                       No players found.{" "}
                       <button
                         onClick={fetchPlayers}
@@ -148,121 +317,126 @@ export default function NordicTable() {
                     </td>
                   </tr>
                 ) : (
-                  filtered.map((p: any) => (
-                    <tr
-                      key={p.nhl_id}
-                      className="hover:bg-slate-50/50 transition-all group"
-                    >
-                      <td className="p-6 font-semibold text-slate-900 group-hover:text-blue-600">
-                        {p.full_name}
-                      </td>
-                      <td className="p-4 text-center text-sm font-mono text-slate-700 uppercase">
-                        {p.position}
-                      </td>
-                      <td className="p-4 text-center">
-                        <span className="w-6 h-6 bg-slate-200 rounded-full text-xs font-bold flex items-center justify-center text-slate-600">
-                          {p.team}
-                        </span>
-                      </td>
-                      <td className="p-4 text-center">
-                        <span
-                          className={`px-3 py-1 rounded-full text-xs font-bold ${
-                            p.status === "FA"
-                              ? "bg-gradient-to-r from-emerald-400 to-emerald-500 text-white shadow-lg"
-                              : "bg-slate-200 text-slate-700"
-                          }`}
-                        >
-                          {p.status}
-                        </span>
-                      </td>
-                      <td className="p-4 text-right">
-                        <div className="text-2xl font-black bg-gradient-to-r from-blue-500 to-purple-600 bg-clip-text text-transparent">
-                          {p.fantasy_score.toFixed(1)}
-                        </div>
-                      </td>
-                      <td
-                        className={`p-3 text-right font-mono text-lg font-bold text-emerald-600 ${
-                          p.goals === 0 ? "opacity-30" : ""
-                        }`}
+                  filtered.map((p) => {
+                    const pct = percentiles[p.nhl_id] || {
+                      goals: 0,
+                      assists: 0,
+                      pim: 0,
+                      ppp: 0,
+                      sog: 0,
+                      hits: 0,
+                      blocks: 0,
+                      fantasy_score: 0,
+                    };
+
+                    return (
+                      <tr
+                        key={p.nhl_id}
+                        className="hover:bg-slate-50/70 transition-colors"
                       >
-                        {p.goals}
-                      </td>
-                      <td
-                        className={`p-3 text-right font-mono text-lg font-bold text-blue-600 ${
-                          p.assists === 0 ? "opacity-30" : ""
-                        }`}
-                      >
-                        {p.assists}
-                      </td>
-                      <td
-                        className={`p-3 text-right font-mono text-lg ${
-                          p.plus_minus > 0
-                            ? "text-emerald-600 font-bold"
-                            : p.plus_minus < 0
-                            ? "text-red-600 font-bold"
-                            : "text-slate-500"
-                        }`}
-                      >
-                        {p.plus_minus}
-                      </td>
-                      <td
-                        className={`p-3 text-right font-mono text-sm ${
-                          p.pim > 0 ? "text-orange-600" : "text-slate-400"
-                        }`}
-                      >
-                        {p.pim}
-                      </td>
-                      <td
-                        className={`p-3 text-right font-mono text-lg text-purple-600 ${
-                          p.ppp === 0 ? "opacity-30" : ""
-                        }`}
-                      >
-                        {p.ppp}
-                      </td>
-                      <td
-                        className={`p-3 text-right font-mono text-sm text-slate-600 ${
-                          p.sog === 0 ? "opacity-30" : ""
-                        }`}
-                      >
-                        {p.sog}
-                      </td>
-                      <td
-                        className={`p-3 text-right font-mono text-lg text-orange-500 ${
-                          p.hits === 0 ? "opacity-30" : ""
-                        }`}
-                      >
-                        {p.hits}
-                      </td>
-                      <td
-                        className={`p-3 text-right font-mono text-lg text-indigo-600 ${
-                          p.blocks === 0 ? "opacity-30" : ""
-                        }`}
-                      >
-                        {p.blocks}
-                      </td>
-                    </tr>
-                  ))
+                        <td className="px-4 py-3">
+                          <div className="font-medium text-slate-900">
+                            {p.full_name}
+                          </div>
+                          <div className="text-[11px] text-slate-400">
+                            ID {p.nhl_id}
+                          </div>
+                        </td>
+                        <td className="px-2 py-3 text-center text-xs text-slate-600">
+                          {p.position}
+                        </td>
+                        <td className="px-2 py-3 text-center">
+                          <span className="inline-flex items-center justify-center rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600">
+                            {p.team}
+                          </span>
+                        </td>
+                        <td className="px-2 py-3 text-center">
+                          <span
+                            className={`inline-flex items-center justify-center rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                              p.status === "FA"
+                                ? "bg-emerald-50 text-emerald-700 border border-emerald-100"
+                                : "bg-slate-100 text-slate-600 border border-slate-200"
+                            }`}
+                          >
+                            {p.status}
+                          </span>
+                        </td>
+                        <td className="px-2 py-3 text-right">
+                          <span className="font-semibold text-slate-900">
+                            {p.fantasy_score.toFixed(1)}
+                          </span>
+                        </td>
+
+                        {tab === "overview" ? (
+                          <>
+                            <td className="px-2 py-3 text-right">
+                              {renderStatCell(p.goals)}
+                            </td>
+                            <td className="px-2 py-3 text-right">
+                              {renderStatCell(p.assists)}
+                            </td>
+                            <td className="px-2 py-3 text-right">
+                              {renderStatCell(p.plus_minus, false)}
+                            </td>
+                            <td className="px-2 py-3 text-right">
+                              {renderStatCell(p.pim)}
+                            </td>
+                            <td className="px-2 py-3 text-right">
+                              {renderStatCell(p.ppp)}
+                            </td>
+                            <td className="px-2 py-3 text-right">
+                              {renderStatCell(p.sog)}
+                            </td>
+                            <td className="px-2 py-3 text-right">
+                              {renderStatCell(p.hits)}
+                            </td>
+                            <td className="px-2 py-3 text-right">
+                              {renderStatCell(p.blocks)}
+                            </td>
+                          </>
+                        ) : (
+                          <>
+                            <td className="px-3 py-3">
+                              {renderBar(pct.goals)}
+                            </td>
+                            <td className="px-3 py-3">
+                              {renderBar(pct.assists)}
+                            </td>
+                            <td className="px-3 py-3">
+                              {renderBar(pct.pim)}
+                            </td>
+                            <td className="px-3 py-3">
+                              {renderBar(pct.ppp)}
+                            </td>
+                            <td className="px-3 py-3">
+                              {renderBar(pct.sog)}
+                            </td>
+                            <td className="px-3 py-3">
+                              {renderBar(pct.hits)}
+                            </td>
+                            <td className="px-3 py-3">
+                              {renderBar(pct.blocks)}
+                            </td>
+                            <td className="px-3 py-3">
+                              {renderBar(pct.fantasy_score)}
+                            </td>
+                          </>
+                        )}
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>
           </div>
         </div>
 
-        <div className="mt-8 p-6 bg-slate-50 rounded-xl border border-slate-200">
-          <div className="text-center text-sm text-slate-500">
-            <p>
-              💾 <strong>{players.length}</strong> total players |
-              <button
-                onClick={fetchPlayers}
-                className="ml-1 underline hover:no-underline text-blue-600 font-medium"
-              >
-                Refresh Data
-              </button>
-            </p>
-            <p className="mt-1">
-              🔄 Last sync: <span id="lastSync"></span>
-            </p>
-          </div>
+        {/* Footer summary */}
+        <div className="flex justify-between items-center text-xs text-slate-500">
+          <span>
+            {players.length} players synced • {filtered.length} shown
+          </span>
+          <span>Percentiles calculated from all synced players</span>
         </div>
       </div>
     </main>
