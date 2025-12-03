@@ -49,62 +49,90 @@ export default async function handler(req, res) {
       })
       .eq("key", "yahoo_auth");
 
-    // 2. SYNC ALL PLAYERS (NO ARTIFICIAL 350 LIMIT)
+    // 2. SYNC ALL PLAYERS WITH STATS + OWNERSHIP
     let start = 0;
     let totalSynced = 0;
-    let batchIndex = 0;
 
     while (true) {
-      const yahooRes = await fetch(
-        `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.33897/players;sort=AR;start=${start};count=25/stats;out=ownership?format=json`,
-        {
-          headers: { Authorization: `Bearer ${tokens.access_token}` },
-        }
+      // A) STATS CALL (what you already had)
+      const statsRes = await fetch(
+        `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.33897/players;sort=AR;start=${start};count=25/stats?format=json`,
+        { headers: { Authorization: `Bearer ${tokens.access_token}` } }
       );
+      if (!statsRes.ok) break;
+      const statsJson = await statsRes.json();
 
-      if (!yahooRes.ok) break;
+      // B) OWNERSHIP CALL (new)
+      const ownRes = await fetch(
+        `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.33897/players;sort=AR;start=${start};count=25;status=A;out=ownership,percent_owned?format=json`,
+        { headers: { Authorization: `Bearer ${tokens.access_token}` } }
+      );
+      if (!ownRes.ok) break;
+      const ownJson = await ownRes.json();
 
-      const yahooData = await yahooRes.json();
-      const leagueNode = yahooData.fantasy_content?.league;
+      // Helper to get players object from league response
+      const extractPlayers = (root) => {
+        const leagueNode = root.fantasy_content?.league;
+        if (Array.isArray(leagueNode)) {
+          return leagueNode.find((n) => n.players)?.players || null;
+        }
+        return leagueNode?.players || null;
+      };
 
-      let playersObj = null;
-      if (Array.isArray(leagueNode)) {
-        playersObj = leagueNode.find((n) => n.players)?.players;
-      } else {
-        playersObj = leagueNode?.players;
+      const statsPlayers = extractPlayers(statsJson);
+      const ownPlayers = extractPlayers(ownJson);
+
+      if (
+        !statsPlayers ||
+        Object.keys(statsPlayers).length === 0 ||
+        !ownPlayers ||
+        Object.keys(ownPlayers).length === 0
+      ) {
+        break;
       }
 
-      if (!playersObj || Object.keys(playersObj).length === 0) {
-        break; // no more pages
+      // Build map: player_id -> { ownership_type, owner_team_name }
+      const ownershipById = {};
+      for (const key in ownPlayers) {
+        if (key === "count") continue;
+        const wrapper = ownPlayers[key];
+        if (!wrapper || !wrapper.player) continue;
+
+        const pdata = wrapper.player;
+        const segs = Array.isArray(pdata) ? pdata : [pdata];
+
+        segs.forEach((item) => {
+          if (item && item.ownership) {
+            const idNode = segs.find((i) => i && i.player_id);
+            const pid = idNode?.player_id;
+            if (!pid) return;
+            ownershipById[pid] = {
+              ownership_type: item.ownership.ownership_type,
+              owner_team_name: item.ownership.owner_team_name || null,
+            };
+          }
+        });
       }
 
       const updates = [];
 
-      for (const key in playersObj) {
+      for (const key in statsPlayers) {
         if (key === "count") continue;
 
-        const wrapper = playersObj[key];
+        const wrapper = statsPlayers[key];
         if (!wrapper || !wrapper.player) continue;
 
         const playerData = wrapper.player;
         const segments = Array.isArray(playerData) ? playerData : [playerData];
 
-        // DEBUG: log first player raw structure once to Vercel logs
-        if (batchIndex === 0 && key === "0") {
-          console.log("DEBUG_YAHOO_PLAYER_RAW", JSON.stringify(playerData));
-        }
-
         let metaObj = null;
         let statsObj = null;
-        let ownerObj = null;
 
         segments.forEach((item) => {
           if (Array.isArray(item) && item.find((sub) => sub && sub.name)) {
             metaObj = item;
           } else if (item && item.player_stats) {
             statsObj = item;
-          } else if (item && item.ownership) {
-            ownerObj = item;
           }
         });
 
@@ -116,6 +144,7 @@ export default async function handler(req, res) {
         const idNode = metaObj.find((i) => i && i.player_id);
 
         if (!nameNode?.name?.full || !idNode?.player_id) continue;
+        const pid = idNode.player_id;
 
         // STATS (hard-coded IDs)
         const stats = {};
@@ -145,24 +174,18 @@ export default async function handler(req, res) {
           plus_minus * 0.5 +
           ppp * 1;
 
-        // OWNERSHIP → status + owner_team_name
+        // OWNERSHIP FROM MAP
+        const own = ownershipById[pid] || null;
         let status = "FA";
         let ownerTeamName = null;
 
-        if (ownerObj && ownerObj.ownership) {
-          const o = ownerObj.ownership;
-          if (o.ownership_type === "team") {
-            status = "TAKEN";
-          } else {
-            status = "FA";
-          }
-          if (o.owner_team_name) {
-            ownerTeamName = o.owner_team_name;
-          }
+        if (own) {
+          if (own.ownership_type === "team") status = "TAKEN";
+          if (own.owner_team_name) ownerTeamName = own.owner_team_name;
         }
 
         updates.push({
-          nhl_id: parseInt(idNode.player_id, 10),
+          nhl_id: parseInt(pid, 10),
           full_name: nameNode.name.full,
           team: teamNode?.editorial_team_abbr || "UNK",
           position: posNode?.display_position || "F",
@@ -186,7 +209,6 @@ export default async function handler(req, res) {
         totalSynced += updates.length;
       }
 
-      batchIndex += 1;
       start += 25;
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
