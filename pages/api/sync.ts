@@ -4,11 +4,9 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   
   // --- CONFIGURATION ---
-  // 1. SUPABASE KEYS (From your project)
   const supabaseUrl = "https://dtunbzugzcpzunnbvzmh.supabase.co";
   const supabaseKey = "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM";
   
-  // 2. YAHOO CREDENTIALS (From your App)
   const yahooClientId = "dj0yJmk9bzdvRlE2Y0ZzdTZaJmQ9WVdrOVpYaDZNWHB4VG1JbWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PWRh";
   const yahooClientSecret = "0c5463680eface4bb3958929f73c891d5618266a";
   const leagueId = "33897"; 
@@ -19,7 +17,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   try {
     // 1. Auth & Refresh
     const { data: authData } = await supabase.from('system_config').select('value').eq('key', 'yahoo_auth').single();
-    if (!authData) throw new Error("Auth token missing. Run the SQL script first.");
+    if (!authData) throw new Error("Auth token missing.");
 
     const refreshRes = await fetch('https://api.login.yahoo.com/oauth2/get_token', {
       method: 'POST',
@@ -36,7 +34,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const newTokens = await refreshRes.json();
     if (newTokens.error) throw new Error("Yahoo Refresh Failed");
 
-    // Keep token fresh
     await supabase.from('system_config').update({
        value: { ...authData.value, access_token: newTokens.access_token }
     }).eq('key', 'yahoo_auth');
@@ -45,9 +42,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     let start = 0;
     const maxPlayers = 300; 
     let totalSynced = 0;
+    let debugSample = {};
 
     while (start < maxPlayers) {
-        // Fetch Stats + Ownership in one call
+        
         const yahooRes = await fetch(
           `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;sort=AR;start=${start};count=25/stats;out=ownership?format=json`, 
           { headers: { 'Authorization': `Bearer ${newTokens.access_token}` } }
@@ -55,11 +53,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         
         const yahooData = await yahooRes.json();
         
-        // --- PARSER: HANDLE YAHOO'S "FAKE ARRAYS" ---
+        // --- PARSER ---
         const leagueNode = yahooData.fantasy_content?.league;
         let playersObj: any = null;
         
-        // Smart Search for the players node
+        // Find players array
         if (Array.isArray(leagueNode)) {
             playersObj = leagueNode.find((n: any) => n.players)?.players;
         } else {
@@ -75,63 +73,54 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             
             const p = playersObj[key].player;
             
-            // --- PARSER: HANDLE "NESTED SANDWICH" ---
-            const flatData = Array.isArray(p) ? p.flat() : [];
-            
-            const metaObj = flatData.find((i: any) => i.name);
-            const statsObj = flatData.find((i: any) => i.player_stats);
-            const ownerObj = flatData.find((i: any) => i.ownership);
+            // Yahoo Structure: [ [Metadata], {Stats}, {Ownership} ]
+            const metaArray = Array.isArray(p[0]) ? p[0] : null;
+            const statsPayload = p[1]; // The object containing player_stats
 
-            if (!metaObj) continue;
+            if (!metaArray) continue;
 
-            // --- STAT MAPPING (KEMPE VERIFIED) ---
+            const nameNode = metaArray.find((i: any) => i.name);
+            const teamNode = metaArray.find((i: any) => i.editorial_team_abbr);
+            const positionNode = metaArray.find((i: any) => i.display_position);
+            const ownershipNode = metaArray.find((i: any) => i.ownership);
+            const idNode = metaArray.find((i: any) => i.player_id);
+
+            if (!nameNode) continue;
+
+            // --- STATS PARSING FIX ---
             const map: any = {};
-            if (statsObj?.player_stats?.stats) {
-                statsObj.player_stats.stats.forEach((wrapper: any) => {
-                    const s = wrapper.stat; 
+            if (statsPayload?.player_stats?.stats) {
+                statsPayload.player_stats.stats.forEach((wrapper: any) => {
+                    // CRITICAL FIX: Unwrap the 'stat' object
+                    const s = wrapper.stat ? wrapper.stat : wrapper;
+                    
                     const val = s.value === '-' ? 0 : parseFloat(s.value);
                     map[s.stat_id] = isNaN(val) ? 0 : val;
                 });
             }
 
-            const position = metaObj.display_position || 'F';
-            const isGoalie = position === 'G';
+            // Debug the first player's stats to verify mapping
+            if (totalSynced === 0) debugSample = { name: nameNode.name.full, stats: map };
 
-            let stats = {};
-            let score = 0;
+            // MAPPING (Standard Yahoo NHL IDs)
+            // 4=Goals, 5=Assists, 31=Hits, 32=Blocks
+            const goals = parseInt(map['4'] || '0');
+            const assists = parseInt(map['5'] || '0');
+            const hits = parseInt(map['31'] || '0');
+            const blks = parseInt(map['32'] || '0');
 
-            if (isGoalie) {
-                const wins = map['19'] || 0;
-                const saves = map['26'] || 0;
-                const shutouts = map['28'] || 0;
-                const ga = map['22'] || 0;
-                
-                score = (wins * 4) + (saves * 0.2) + (shutouts * 2) - (ga * 1);
-                stats = { wins, saves, shutouts, goals_against: ga, goals: 0, assists: 0, hits: 0, blocks: 0 };
-            } else {
-                const goals = map['1'] || 0;      
-                const assists = map['2'] || 0;    
-                const plus_minus = map['4'] || 0; 
-                const pim = map['5'] || 0;        
-                const ppp = map['8'] || 0;        
-                const sog = map['14'] || 0;       
-                const hits = map['31'] || 0;      
-                const blks = map['32'] || 0;      
-
-                score = (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5) + (sog * 0.4) + (plus_minus * 0.5) + (ppp * 1);
-                stats = { goals, assists, plus_minus, pim, ppp, sog, hits, blocks: blks };
-            }
-
-            // --- OWNERSHIP MAPPING ---
-            const ownershipType = ownerObj?.ownership?.ownership_type || 'freeagents';
+            // Status Logic
+            const ownershipType = ownershipNode?.ownership?.ownership_type || 'freeagents';
             const status = ownershipType === 'team' ? 'TAKEN' : 'FA';
 
+            const score = (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5);
+
             updates.push({
-                nhl_id: parseInt(metaObj.player_id), 
-                full_name: metaObj.name.full,
-                team: metaObj.editorial_team_abbr || 'UNK',
-                position: position,
-                ...stats,
+                nhl_id: parseInt(idNode?.player_id), 
+                full_name: nameNode.name.full,
+                team: teamNode?.editorial_team_abbr || 'UNK',
+                position: positionNode?.display_position || 'F',
+                goals, assists, hits, blocks: blks,
                 status: status,
                 fantasy_score: score,
                 last_updated: new Date().toISOString()
@@ -149,7 +138,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     res.status(200).json({ 
         success: true, 
-        message: `Synced ${totalSynced} players successfully!`
+        message: `Synced ${totalSynced} players.`,
+        debug_check: debugSample // Check this in browser to verify IDs
     });
 
   } catch (error: any) {
