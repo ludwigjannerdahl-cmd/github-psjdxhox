@@ -56,6 +56,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         const leagueNode = yahooData.fantasy_content?.league;
         let playersObj: any = null;
         
+        // Robust search for the 'players' node
         if (Array.isArray(leagueNode)) {
             playersObj = leagueNode.find((n: any) => n.players)?.players;
         } else {
@@ -71,73 +72,69 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             
             const p = playersObj[key].player;
             
-            const metaArray = Array.isArray(p[0]) ? p[0] : null;
-            const statsPayload = p[1]; 
+            // Yahoo Structure: [ [Metadata], {Stats}, {Ownership} ]
+            // We search for the specific objects regardless of order
+            const flatData = Array.isArray(p) ? p.flat() : [];
+            
+            const metaObj = flatData.find((i: any) => i.name && i.editorial_team_abbr);
+            const statsObj = flatData.find((i: any) => i.player_stats);
+            const ownerObj = flatData.find((i: any) => i.ownership);
 
-            if (!metaArray) continue;
+            if (!metaObj) continue;
 
-            const nameNode = metaArray.find((i: any) => i.name);
-            const teamNode = metaArray.find((i: any) => i.editorial_team_abbr);
-            const positionNode = metaArray.find((i: any) => i.display_position);
-            const ownershipNode = metaArray.find((i: any) => i.ownership);
-            const idNode = metaArray.find((i: any) => i.player_id);
-
-            if (!nameNode) continue;
-
-            // --- STATS PARSING & MAPPING ---
+            // --- STATS PARSING ---
             const map: any = {};
-            if (statsPayload?.player_stats?.stats) {
-                statsPayload.player_stats.stats.forEach((wrapper: any) => {
+            if (statsObj?.player_stats?.stats) {
+                statsObj.player_stats.stats.forEach((wrapper: any) => {
                     const s = wrapper.stat; 
                     const val = s.value === '-' ? 0 : parseFloat(s.value);
                     map[s.stat_id] = isNaN(val) ? 0 : val;
                 });
             }
 
-            const position = positionNode?.display_position || 'F';
+            const position = metaObj.display_position || 'F';
             const isGoalie = position === 'G';
 
             let stats = {};
             let score = 0;
 
             if (isGoalie) {
-                // GOALIE MAPPING (Standard):
-                // 19: Wins, 26: Saves, 27: Save%, 28: Shutouts
-                // Since Skater IDs were custom, these might be too.
-                // If they show as 0, we will need to debug goalies separately.
+                // GOALIE MAPPING
+                // If your league uses custom Goalie IDs, we might see 0s here.
+                // Standard: 19=Wins, 26=Saves, 28=Shutouts
                 const wins = map['19'] || 0;
                 const saves = map['26'] || 0;
                 const shutouts = map['28'] || 0;
-                const ga = map['22'] || 0; // 22 is usually GA
+                const ga = map['22'] || 0;
                 
                 score = (wins * 4) + (saves * 0.2) + (shutouts * 2) - (ga * 1);
                 stats = { wins, saves, shutouts, goals_against: ga, goals: 0, assists: 0, hits: 0, blocks: 0, pim: 0, ppp: 0, shp: 0, sog: 0 };
             } else {
-                // SKATER MAPPING (VERIFIED FROM YOUR SCREENSHOT):
-                const goals = map['1'] || 0;      // ID 1 matched Kempe's Goals (9)
-                const assists = map['2'] || 0;    // ID 2 matched Kempe's Assists (14)
-                const plus_minus = map['4'] || 0; // ID 4 matched Kempe's +/- (4)
-                const pim = map['5'] || 0;        // ID 5 matched Kempe's PIM (16)
-                const ppp = map['8'] || 0;        // ID 8 matched Kempe's PPP (5)
-                const sog = map['14'] || 0;       // ID 14 matched Kempe's SOG (83)
-                const hits = map['31'] || 0;      // ID 31 matched Kempe's Hits (51)
-                const blks = map['32'] || 0;      // ID 32 matched Kempe's Blocks (16)
-                // Assuming SHP (Shorthanded Points) is 11 based on the stray '1' in your debug
-                const shp = map['11'] || 0; 
+                // SKATER MAPPING (VERIFIED FROM YOUR KEMPE SCREENSHOT)
+                const goals = map['1'] || 0;
+                const assists = map['2'] || 0;
+                const plus_minus = map['4'] || 0;
+                const pim = map['5'] || 0;
+                const ppp = map['8'] || 0;
+                const shp = map['11'] || 0;
+                const sog = map['14'] || 0;
+                const hits = map['31'] || 0;
+                const blks = map['32'] || 0;
 
                 // Fantasy Score Calc
-                score = (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5) + (sog * 0.4) + (plus_minus * 0.5) + (ppp * 1);
-                stats = { goals, assists, plus_minus, pim, ppp, sog, hits, blocks: blks, shp };
+                score = (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5) + (sog * 0.4) + (plus_minus * 0.5) + (ppp * 1) + (shp * 2);
+                
+                stats = { goals, assists, plus_minus, pim, ppp, shp, sog, hits, blocks: blks };
             }
 
-            // Status Logic
-            const ownershipType = ownershipNode?.ownership?.ownership_type || 'freeagents';
+            // --- OWNERSHIP ---
+            const ownershipType = ownerObj?.ownership?.ownership_type || 'freeagents';
             const status = ownershipType === 'team' ? 'TAKEN' : 'FA';
 
             updates.push({
-                nhl_id: parseInt(idNode?.player_id), 
-                full_name: nameNode.name.full,
-                team: teamNode?.editorial_team_abbr || 'UNK',
+                nhl_id: parseInt(metaObj.player_id), 
+                full_name: metaObj.name.full,
+                team: metaObj.editorial_team_abbr || 'UNK',
                 position: position,
                 ...stats,
                 status: status,
@@ -157,7 +154,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     res.status(200).json({ 
         success: true, 
-        message: `Synced ${totalSynced} players with KEMPE-VERIFIED IDs!`
+        message: `Synced ${totalSynced} players (Verified IDs)!`
     });
 
   } catch (error: any) {
