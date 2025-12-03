@@ -49,11 +49,12 @@ export default async function handler(req, res) {
       })
       .eq("key", "yahoo_auth");
 
-    // 2. SYNC ALL PLAYERS
+    // 2. SYNC ALL PLAYERS (NO ARTIFICIAL 350 LIMIT)
     let start = 0;
     let totalSynced = 0;
+    let batchIndex = 0;
 
-    while (start < 350) {
+    while (true) {
       const yahooRes = await fetch(
         `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.33897/players;sort=AR;start=${start};count=25/stats;out=ownership?format=json`,
         {
@@ -73,7 +74,9 @@ export default async function handler(req, res) {
         playersObj = leagueNode?.players;
       }
 
-      if (!playersObj || Object.keys(playersObj).length === 0) break;
+      if (!playersObj || Object.keys(playersObj).length === 0) {
+        break; // no more pages
+      }
 
       const updates = [];
 
@@ -85,6 +88,11 @@ export default async function handler(req, res) {
 
         const playerData = wrapper.player;
         const segments = Array.isArray(playerData) ? playerData : [playerData];
+
+        // DEBUG: log first player raw structure once to Vercel logs
+        if (batchIndex === 0 && key === "0") {
+          console.log("DEBUG_YAHOO_PLAYER_RAW", JSON.stringify(playerData));
+        }
 
         let metaObj = null;
         let statsObj = null;
@@ -141,11 +149,8 @@ export default async function handler(req, res) {
         let status = "FA";
         let ownerTeamName = null;
 
-        const ownershipSegment = segments.find(
-          (item) => item && item.ownership
-        );
-        if (ownershipSegment && ownershipSegment.ownership) {
-          const o = ownershipSegment.ownership;
+        if (ownerObj && ownerObj.ownership) {
+          const o = ownerObj.ownership;
           if (o.ownership_type === "team") {
             status = "TAKEN";
           } else {
@@ -181,6 +186,7 @@ export default async function handler(req, res) {
         totalSynced += updates.length;
       }
 
+      batchIndex += 1;
       start += 25;
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
