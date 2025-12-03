@@ -3,11 +3,12 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   
-  // --- HARDCODED CONFIGURATION ---
+  // --- CONFIGURATION ---
+  // 1. SUPABASE KEYS (From your project)
   const supabaseUrl = "https://dtunbzugzcpzunnbvzmh.supabase.co";
-  // Use the SERVICE ROLE key (starts with ey...) for the backend script!
-  const supabaseKey = "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM"; 
+  const supabaseKey = "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM";
   
+  // 2. YAHOO CREDENTIALS (From your App)
   const yahooClientId = "dj0yJmk9bzdvRlE2Y0ZzdTZaJmQ9WVdrOVpYaDZNWHB4VG1JbWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PWRh";
   const yahooClientSecret = "0c5463680eface4bb3958929f73c891d5618266a";
   const leagueId = "33897"; 
@@ -35,6 +36,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const newTokens = await refreshRes.json();
     if (newTokens.error) throw new Error("Yahoo Refresh Failed");
 
+    // Keep token fresh
     await supabase.from('system_config').update({
        value: { ...authData.value, access_token: newTokens.access_token }
     }).eq('key', 'yahoo_auth');
@@ -45,8 +47,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     let totalSynced = 0;
 
     while (start < maxPlayers) {
-        
-        // We explicitly request 'stats' and 'ownership'
+        // Fetch Stats + Ownership in one call
         const yahooRes = await fetch(
           `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.${leagueId}/players;sort=AR;start=${start};count=25/stats;out=ownership?format=json`, 
           { headers: { 'Authorization': `Bearer ${newTokens.access_token}` } }
@@ -54,12 +55,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         
         const yahooData = await yahooRes.json();
         
-        // --- PARSING: FIND THE PLAYERS COLLECTION ---
+        // --- PARSER: HANDLE YAHOO'S "FAKE ARRAYS" ---
         const leagueNode = yahooData.fantasy_content?.league;
         let playersObj: any = null;
         
+        // Smart Search for the players node
         if (Array.isArray(leagueNode)) {
-            // Search for the object that has 'players' key
             playersObj = leagueNode.find((n: any) => n.players)?.players;
         } else {
             playersObj = leagueNode?.players;
@@ -69,14 +70,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
         const updates: any[] = [];
 
-        // Loop through the "Fake Array" (Objects 0, 1, 2...)
         for (const key in playersObj) {
             if (key === 'count') continue;
             
-            const p = playersObj[key].player; // This is the "Sandwich" Array
+            const p = playersObj[key].player;
             
-            // --- PARSING: PROPERTY DETECTION ---
-            // We flatten the array and search for objects with specific keys
+            // --- PARSER: HANDLE "NESTED SANDWICH" ---
             const flatData = Array.isArray(p) ? p.flat() : [];
             
             const metaObj = flatData.find((i: any) => i.name);
@@ -85,7 +84,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
             if (!metaObj) continue;
 
-            // --- STATS MAPPING ---
+            // --- STAT MAPPING (KEMPE VERIFIED) ---
             const map: any = {};
             if (statsObj?.player_stats?.stats) {
                 statsObj.player_stats.stats.forEach((wrapper: any) => {
@@ -102,7 +101,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             let score = 0;
 
             if (isGoalie) {
-                // GOALIE MAPPING
                 const wins = map['19'] || 0;
                 const saves = map['26'] || 0;
                 const shutouts = map['28'] || 0;
@@ -111,7 +109,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
                 score = (wins * 4) + (saves * 0.2) + (shutouts * 2) - (ga * 1);
                 stats = { wins, saves, shutouts, goals_against: ga, goals: 0, assists: 0, hits: 0, blocks: 0 };
             } else {
-                // SKATER MAPPING (Verified IDs)
                 const goals = map['1'] || 0;      
                 const assists = map['2'] || 0;    
                 const plus_minus = map['4'] || 0; 
@@ -152,7 +149,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     res.status(200).json({ 
         success: true, 
-        message: `Synced ${totalSynced} players using PROPERTY DETECTION!`
+        message: `Synced ${totalSynced} players successfully!`
     });
 
   } catch (error: any) {
