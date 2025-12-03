@@ -15,7 +15,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
-    // 1. Auth
+    // 1. Auth & Refresh
     const { data: authData } = await supabase.from('system_config').select('value').eq('key', 'yahoo_auth').single();
     if (!authData) throw new Error("Auth token missing.");
 
@@ -38,12 +38,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
        value: { ...authData.value, access_token: newTokens.access_token }
     }).eq('key', 'yahoo_auth');
 
-    // 2. FETCH LOOP (Top 100 players for speed test)
-    // We fetch 'stats' to get the numbers
+    // 2. FETCH LOOP
     let start = 0;
-    const maxPlayers = 100; 
+    const maxPlayers = 300; 
     let totalSynced = 0;
-    let sampleStats = {}; // To debug what IDs we are getting
+    let debugSample = {};
 
     while (start < maxPlayers) {
         
@@ -58,7 +57,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         const leagueNode = yahooData.fantasy_content?.league;
         let playersObj: any = null;
         
-        // Smart Find
+        // Find players array
         if (Array.isArray(leagueNode)) {
             playersObj = leagueNode.find((n: any) => n.players)?.players;
         } else {
@@ -74,9 +73,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             
             const p = playersObj[key].player;
             
-            // Yahoo Structure: [ [Metadata...], {Stats} ]
+            // Yahoo Structure: [ [Metadata], {Stats}, {Ownership} ]
             const metaArray = Array.isArray(p[0]) ? p[0] : null;
-            const statsPayload = p[1];
+            const statsPayload = p[1]; // The object containing player_stats
 
             if (!metaArray) continue;
 
@@ -88,44 +87,62 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
             if (!nameNode) continue;
 
-            // --- STATS PARSING ---
+            // --- STATS PARSING FIX ---
             const map: any = {};
             if (statsPayload?.player_stats?.stats) {
-                statsPayload.player_stats.stats.forEach((s: any) => {
-                    // Convert value to number immediately, handle '-' as 0
+                statsPayload.player_stats.stats.forEach((wrapper: any) => {
+                    // CRITICAL FIX: Unwrap the 'stat' object
+                    const s = wrapper.stat; 
                     const val = s.value === '-' ? 0 : parseFloat(s.value);
                     map[s.stat_id] = isNaN(val) ? 0 : val;
                 });
             }
 
-            // Capture first player's stats for debugging
-            if (totalSynced === 0) sampleStats = map;
+            // Debug the first player's stats to verify mapping
+            if (totalSynced === 0) debugSample = { name: nameNode.name.full, stats: map };
 
-            // MAPPING (Standard Yahoo)
-            // If these are 0, your league uses different IDs. We will see in the debug output.
-            const goals = map['4'] || 0;
-            const assists = map['5'] || 0;
-            const plus_minus = map['1'] || 0; // Check debug output for correct ID
-            const pim = map['9'] || 0;
-            const ppp = map['12'] || 0;
-            const sog = map['14'] || 0;
-            const hits = map['31'] || 0;
-            const blks = map['32'] || 0;
+            // MAP IDS (Standard Yahoo NHL):
+            // 2=Goals, 3=Assists, 4=+/-, 5=PIM, 8=PPP, 14=SOG, 31=HIT, 32=BLK
+            // GOALIES: 19=Wins, 26=Saves, 27=Save%, 28=Shutouts
+            
+            const position = positionNode?.display_position || 'F';
+            const isGoalie = position === 'G';
+
+            let stats = {};
+            let score = 0;
+
+            if (isGoalie) {
+                const wins = map['19'] || 0;
+                const saves = map['26'] || 0;
+                const shutouts = map['28'] || 0;
+                // Assuming standard goalie scoring: Win(4) + Save(0.2) + Shutout(2) - GA(1)
+                score = (wins * 4) + (saves * 0.2) + (shutouts * 2);
+                stats = { wins, saves, shutouts, goals: 0, assists: 0, hits: 0, blocks: 0 };
+            } else {
+                const goals = map['2'] || 0; 
+                const assists = map['3'] || 0; 
+                const plus_minus = map['4'] || 0;
+                const pim = map['5'] || 0;
+                const ppp = map['8'] || 0;
+                const sog = map['14'] || 0;
+                const hits = map['31'] || 0;
+                const blks = map['32'] || 0;
+
+                // Fantasy Score
+                score = (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5) + (sog * 0.4) + (plus_minus * 0.5);
+                stats = { goals, assists, plus_minus, pim, ppp, sog, hits, blocks: blks };
+            }
 
             // Status Logic
             const ownershipType = ownershipNode?.ownership?.ownership_type || 'freeagents';
             const status = ownershipType === 'team' ? 'TAKEN' : 'FA';
 
-            // Z-Score (Simplified for now)
-            const score = (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5) + (sog * 0.4);
-
             updates.push({
-                nhl_id: parseInt(idNode?.player_id), // Storing Yahoo ID here
+                nhl_id: parseInt(idNode?.player_id), 
                 full_name: nameNode.name.full,
                 team: teamNode?.editorial_team_abbr || 'UNK',
-                position: positionNode?.display_position || 'F',
-                goals, assists, hits, blocks: blks,
-                pim, ppp, sog, plus_minus,
+                position: position,
+                ...stats,
                 status: status,
                 fantasy_score: score,
                 last_updated: new Date().toISOString()
@@ -144,7 +161,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     res.status(200).json({ 
         success: true, 
         message: `Synced ${totalSynced} players.`,
-        debug_stat_map: sampleStats // THIS WILL TELL US THE REAL IDs
+        debug_check: debugSample // Check this in browser to verify IDs
     });
 
   } catch (error: any) {
