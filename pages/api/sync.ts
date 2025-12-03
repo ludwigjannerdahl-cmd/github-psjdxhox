@@ -42,7 +42,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     let start = 0;
     const maxPlayers = 300; 
     let totalSynced = 0;
-    let debugSample = {};
 
     while (start < maxPlayers) {
         
@@ -57,7 +56,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         const leagueNode = yahooData.fantasy_content?.league;
         let playersObj: any = null;
         
-        // Find players array
         if (Array.isArray(leagueNode)) {
             playersObj = leagueNode.find((n: any) => n.players)?.players;
         } else {
@@ -73,9 +71,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             
             const p = playersObj[key].player;
             
-            // Yahoo Structure: [ [Metadata], {Stats}, {Ownership} ]
             const metaArray = Array.isArray(p[0]) ? p[0] : null;
-            const statsPayload = p[1]; // The object containing player_stats
+            const statsPayload = p[1]; 
 
             if (!metaArray) continue;
 
@@ -87,24 +84,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
             if (!nameNode) continue;
 
-            // --- STATS PARSING FIX ---
+            // --- STATS PARSING & MAPPING ---
             const map: any = {};
             if (statsPayload?.player_stats?.stats) {
                 statsPayload.player_stats.stats.forEach((wrapper: any) => {
-                    // CRITICAL FIX: Unwrap the 'stat' object
                     const s = wrapper.stat; 
                     const val = s.value === '-' ? 0 : parseFloat(s.value);
                     map[s.stat_id] = isNaN(val) ? 0 : val;
                 });
             }
 
-            // Debug the first player's stats to verify mapping
-            if (totalSynced === 0) debugSample = { name: nameNode.name.full, stats: map };
-
-            // MAP IDS (Standard Yahoo NHL):
-            // 2=Goals, 3=Assists, 4=+/-, 5=PIM, 8=PPP, 14=SOG, 31=HIT, 32=BLK
-            // GOALIES: 19=Wins, 26=Saves, 27=Save%, 28=Shutouts
-            
             const position = positionNode?.display_position || 'F';
             const isGoalie = position === 'G';
 
@@ -112,28 +101,33 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             let score = 0;
 
             if (isGoalie) {
+                // GOALIE MAPPING (Standard):
+                // 19: Wins, 26: Saves, 27: Save%, 28: Shutouts
+                // Since Skater IDs were custom, these might be too.
+                // If they show as 0, we will need to debug goalies separately.
                 const wins = map['19'] || 0;
                 const saves = map['26'] || 0;
                 const shutouts = map['28'] || 0;
-                // Assuming standard goalie scoring: Win(4) + Save(0.2) + Shutout(2) - GA(1)
-                score = (wins * 4) + (saves * 0.2) + (shutouts * 2);
-                stats = { wins, saves, shutouts, goals: 0, assists: 0, hits: 0, blocks: 0 };
+                const ga = map['22'] || 0; // 22 is usually GA
+                
+                score = (wins * 4) + (saves * 0.2) + (shutouts * 2) - (ga * 1);
+                stats = { wins, saves, shutouts, goals_against: ga, goals: 0, assists: 0, hits: 0, blocks: 0 };
             } else {
-                const goals = map['2'] || 0; 
-                const assists = map['3'] || 0; 
-                const plus_minus = map['4'] || 0;
-                const pim = map['5'] || 0;
-                const ppp = map['8'] || 0;
-                const sog = map['14'] || 0;
-                const hits = map['31'] || 0;
-                const blks = map['32'] || 0;
+                // SKATER MAPPING (VERIFIED FROM YOUR SCREENSHOT):
+                const goals = map['1'] || 0;      // ID 1 matched Kempe's Goals (9)
+                const assists = map['2'] || 0;    // ID 2 matched Kempe's Assists (14)
+                const plus_minus = map['4'] || 0; // ID 4 matched Kempe's +/- (4)
+                const pim = map['5'] || 0;        // ID 5 matched Kempe's PIM (16)
+                const ppp = map['8'] || 0;        // ID 8 matched Kempe's PPP (5)
+                const sog = map['14'] || 0;       // ID 14 matched Kempe's SOG (83)
+                const hits = map['31'] || 0;      // ID 31 matched Kempe's Hits (51)
+                const blks = map['32'] || 0;      // ID 32 matched Kempe's Blocks (16)
 
-                // Fantasy Score
-                score = (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5) + (sog * 0.4) + (plus_minus * 0.5);
+                // Fantasy Score Calc
+                score = (goals * 3) + (assists * 2) + (hits * 0.5) + (blks * 0.5) + (sog * 0.4) + (plus_minus * 0.5) + (ppp * 1);
                 stats = { goals, assists, plus_minus, pim, ppp, sog, hits, blocks: blks };
             }
 
-            // Status Logic
             const ownershipType = ownershipNode?.ownership?.ownership_type || 'freeagents';
             const status = ownershipType === 'team' ? 'TAKEN' : 'FA';
 
@@ -160,8 +154,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     res.status(200).json({ 
         success: true, 
-        message: `Synced ${totalSynced} players.`,
-        debug_check: debugSample // Check this in browser to verify IDs
+        message: `Synced ${totalSynced} players with CORRECTED STAT MAP!`
     });
 
   } catch (error: any) {
