@@ -1,19 +1,21 @@
 import { createClient } from "@supabase/supabase-js";
 import YahooFantasy from "yahoo-fantasy";
 
-const supabase = createClient(
-  "https://dtunbzugzcpzunnbvzmh.supabase.co",
-  "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM"
-);
+const SUPABASE_URL = "https://dtunbzugzcpzunnbvzmh.supabase.co";
+const SUPABASE_SERVICE_KEY = "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM";
 
-const CONSUMER_KEY = "dj0yJmk9bzdvRlE2Y0ZzdTZaJmQ9WVdrOVpYaDZNWHB4VG1JbWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PWRh";
+const CONSUMER_KEY =
+  "dj0yJmk9bzdvRlE2Y0ZzdTZaJmQ9WVdrOVpYaDZNWHB4VG1JbWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PWRh";
 const CONSUMER_SECRET = "0c5463680eface4bb3958929f73c891d5618266a";
-const LEAGUE_KEY = "465.l.33897";
-const GAME_KEY = "465";
+
+const LEAGUE_KEY = "465.l.33897"; // ÄnHåEll 2025
+const GAME_KEY = "465";           // NHL 2025
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 export default async function handler(req, res) {
   try {
-    // 1) Load Yahoo tokens from Supabase
+    // 1) LOAD YAHOO TOKENS FROM SUPABASE
     const { data: authData, error: authErr } = await supabase
       .from("system_config")
       .select("value")
@@ -25,12 +27,12 @@ export default async function handler(req, res) {
       throw new Error("No yahoo_auth access_token stored");
     }
 
-    // 2) Init YahooFantasy client
+    // 2) INIT YahooFantasy CLIENT
     const yf = new YahooFantasy(
       CONSUMER_KEY,
       CONSUMER_SECRET,
       async (tokenData) => {
-        // refresh callback: persist new tokens
+        // refresh callback -> persist in system_config
         await supabase
           .from("system_config")
           .update({ value: { ...authData.value, ...tokenData } })
@@ -44,7 +46,7 @@ export default async function handler(req, res) {
       yf.setRefreshToken(authData.value.refresh_token);
     }
 
-    // 3) PHASE A – pull league players + stats via wrapper
+    // 3) PHASE A – STATS SYNC (league players /stats)
     let start = 0;
     const pageSize = 25;
     let totalSynced = 0;
@@ -55,7 +57,7 @@ export default async function handler(req, res) {
         `/fantasy/v2/league/${LEAGUE_KEY}` +
         `/players;sort=AR;start=${start};count=${pageSize}/stats`;
 
-      const statsJson = await yf.api(yf.GET, url); // wrapper handles auth etc
+      const statsJson = await yf.api(yf.GET, url); // wrapper handles auth/refresh
 
       const leagueNode = statsJson.fantasy_content?.league;
       let playersObj = null;
@@ -73,10 +75,10 @@ export default async function handler(req, res) {
       for (const key in playersObj) {
         if (key === "count") continue;
 
-        const wrapper = playersObj[key];
-        if (!wrapper || !wrapper.player) continue;
+        const wrap = playersObj[key];
+        if (!wrap || !wrap.player) continue;
 
-        const pData = wrapper.player;
+        const pData = wrap.player;
         const segs = Array.isArray(pData) ? pData : [pData];
 
         let metaObj = null;
@@ -160,14 +162,15 @@ export default async function handler(req, res) {
       await new Promise((r) => setTimeout(r, 500));
     }
 
-    // 4) PHASE B – ownership via league players ownership, still using yf.api
+    // 4) PHASE B – GRANULAR OWNERSHIP USING league players;player_keys=/ownership
 
+    // Reset default
     await supabase
       .from("players")
       .update({ status: "FA", owner_team_name: null });
 
     const uniqueIds = Array.from(new Set(syncedIds));
-    const batchSize = 20;
+    const batchSize = 20; // number of player_keys per ownership call
 
     for (let i = 0; i < uniqueIds.length; i += batchSize) {
       const idBatch = uniqueIds.slice(i, i + batchSize);
@@ -194,10 +197,10 @@ export default async function handler(req, res) {
       for (const key in playersObj2) {
         if (key === "count") continue;
 
-        const wrapper = playersObj2[key];
-        if (!wrapper || !wrapper.player) continue;
+        const wrap = playersObj2[key];
+        if (!wrap || !wrap.player) continue;
 
-        const pData = wrapper.player;
+        const pData = wrap.player;
         const segs = Array.isArray(pData) ? pData : [pData];
 
         const idNode = segs.find((x) => x && x.player_id);
@@ -241,7 +244,7 @@ export default async function handler(req, res) {
 
     res.json({
       success: true,
-      message: `Synced ${totalSynced} players with ownership`,
+      message: `Synced ${totalSynced} players with granular ownership`,
       count: totalSynced,
     });
   } catch (err) {
