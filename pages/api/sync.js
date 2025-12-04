@@ -8,17 +8,18 @@ export default async function handler(req, res) {
 
   try {
     // 1) REFRESH YAHOO TOKEN
-    const { data: authData } = await supabase
+    const { data: authData, error: authErr } = await supabase
       .from("system_config")
       .select("value")
       .eq("key", "yahoo_auth")
       .single();
 
+    if (authErr) throw authErr;
     if (!authData?.value?.refresh_token) {
       throw new Error("No Yahoo auth token in system_config");
     }
 
-    const tokens = await fetch(
+    const tokenRes = await fetch(
       "https://api.login.yahoo.com/oauth2/get_token",
       {
         method: "POST",
@@ -32,8 +33,9 @@ export default async function handler(req, res) {
           grant_type: "refresh_token",
         }),
       }
-    ).then((r) => r.json());
+    );
 
+    const tokens = await tokenRes.json();
     if (tokens.error) {
       throw new Error(
         `Yahoo token refresh failed: ${
@@ -49,6 +51,8 @@ export default async function handler(req, res) {
       })
       .eq("key", "yahoo_auth");
 
+    const authHeader = { Authorization: `Bearer ${tokens.access_token}` };
+
     // 2) PHASE A – STATS: SYNC ALL LEAGUE PLAYERS
     let start = 0;
     let totalSynced = 0;
@@ -56,7 +60,7 @@ export default async function handler(req, res) {
     while (true) {
       const statsRes = await fetch(
         `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.33897/players;sort=AR;start=${start};count=25/stats?format=json`,
-        { headers: { Authorization: `Bearer ${tokens.access_token}` } }
+        { headers: authHeader }
       );
       if (!statsRes.ok) break;
 
@@ -110,8 +114,8 @@ export default async function handler(req, res) {
         if (statsObj?.player_stats?.stats) {
           statsObj.player_stats.stats.forEach((w) => {
             const s = w.stat;
-            const val = s.value === "-" ? 0 : parseFloat(s.value || "0");
-            stats[s.stat_id] = isNaN(val) ? 0 : val;
+            const raw = s.value === "-" ? 0 : parseFloat(s.value || "0");
+            stats[s.stat_id] = isNaN(raw) ? 0 : raw;
           });
         }
 
@@ -152,7 +156,10 @@ export default async function handler(req, res) {
       }
 
       if (updates.length > 0) {
-        await supabase.from("players").upsert(updates, { onConflict: "nhl_id" });
+        const { error } = await supabase
+          .from("players")
+          .upsert(updates, { onConflict: "nhl_id" });
+        if (error) throw error;
         totalSynced += updates.length;
       }
 
@@ -160,11 +167,12 @@ export default async function handler(req, res) {
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
 
-    // 3) PHASE B – OWNERSHIP (DEBUG LOGGING ONLY FOR NOW)
+    // 3) PHASE B – OWNERSHIP FROM ROSTERS
 
+    // 3a) get all teams in league (you already logged this JSON)
     const leagueTeamsRes = await fetch(
       "https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.33897/teams?format=json",
-      { headers: { Authorization: `Bearer ${tokens.access_token}` } }
+      { headers: authHeader }
     );
 
     const takenIds = new Set();
@@ -172,12 +180,8 @@ export default async function handler(req, res) {
 
     if (leagueTeamsRes.ok) {
       const leagueTeamsJson = await leagueTeamsRes.json();
-      console.log(
-        "DEBUG_LEAGUE_TEAMS_ROOT",
-        JSON.stringify(leagueTeamsJson)
-      );
-
       const lNode = leagueTeamsJson.fantasy_content?.league;
+
       let teamsObj = null;
       if (Array.isArray(lNode)) {
         teamsObj = lNode.find((n) => n.teams)?.teams || null;
@@ -188,11 +192,12 @@ export default async function handler(req, res) {
       if (teamsObj) {
         for (const key in teamsObj) {
           if (key === "count") continue;
+
           const tWrapper = teamsObj[key];
           if (!tWrapper || !tWrapper.team) continue;
 
-          const teamData = tWrapper.team;
-          const tSegs = Array.isArray(teamData) ? teamData : [teamData];
+          const tData = tWrapper.team;
+          const tSegs = Array.isArray(tData) ? tData : [tData];
 
           const teamKeyNode = tSegs.find((i) => i && i.team_key);
           const teamNameNode = tSegs.find((i) => i && i.name);
@@ -202,64 +207,85 @@ export default async function handler(req, res) {
 
           if (!teamKey) continue;
 
+          // 3b) roster for this team – we know from your sample the JSON has team + roster + roster.players
           const rosterRes = await fetch(
             `https://fantasysports.yahooapis.com/fantasy/v2/team/${teamKey}/roster/players?format=json`,
-            { headers: { Authorization: `Bearer ${tokens.access_token}` } }
+            { headers: authHeader }
           );
-
-          if (!rosterRes.ok) {
-            console.log("DEBUG_ROSTER_ERROR", teamKey, rosterRes.status);
-            continue;
-          }
+          if (!rosterRes.ok) continue;
 
           const rosterJson = await rosterRes.json();
-          console.log(
-            "DEBUG_ROSTER_ROOT",
-            teamKey,
-            JSON.stringify(rosterJson)
-          );
+          const teamNode = rosterJson.fantasy_content?.team;
 
-          const rTeamNode = rosterJson.fantasy_content?.team;
-          let rPlayersObj = null;
+          let playersArray = null;
 
-          if (Array.isArray(rTeamNode)) {
-            const rosterNode = rTeamNode.find((n) => n.roster)?.roster;
-            if (rosterNode && rosterNode.players) {
-              rPlayersObj = rosterNode.players;
+          if (Array.isArray(teamNode)) {
+            // structure: [ meta..., { roster: { players: { "0": {...}, ... } } } ]
+            const rosterNode = teamNode.find((n) => n.roster)?.roster;
+            if (rosterNode && Array.isArray(rosterNode.players)) {
+              // some wrappers flatten to array
+              playersArray = rosterNode.players;
+            } else if (rosterNode && rosterNode.players) {
+              playersArray = rosterNode.players;
             }
-          } else if (rTeamNode?.roster?.players) {
-            rPlayersObj = rTeamNode.roster.players;
+          } else if (teamNode?.roster?.players) {
+            playersArray = teamNode.roster.players;
           }
 
-          if (!rPlayersObj) continue;
+          if (!playersArray) continue;
 
-          for (const pk in rPlayersObj) {
-            if (pk === "count") continue;
-            const pWrap = rPlayersObj[pk];
-            if (!pWrap || !pWrap.player) continue;
+          // playersArray is an object with numeric keys or an array; your sample file is already flattened
+          const iterable =
+            Array.isArray(playersArray) ? playersArray : Object.values(playersArray);
 
-            const pdata = pWrap.player;
-            const pSegs = Array.isArray(pdata) ? pdata : [pdata];
-            const idNode = pSegs.find((i) => i && i.player_id);
-            const pidStr = idNode?.player_id;
+          for (const p of iterable) {
+            const playerObj = p.player || p; // depending on shape
+
+            const pidStr = playerObj.player_id;
             if (!pidStr) continue;
 
             const pid = parseInt(pidStr, 10);
             takenIds.add(pid);
-            ownerById[pid] = teamName;
+
+            const own = playerObj.ownership;
+            const ownerName =
+              own?.owner_team_name && typeof own.owner_team_name === "string"
+                ? own.owner_team_name
+                : teamName;
+            ownerById[pid] = ownerName;
           }
         }
       }
     }
 
-    // For now, do NOT update statuses until parsing is confirmed.
-    // Once DEBUG_* logs look correct in Vercel, the next step is to
-    // use takenIds / ownerById to set status + owner_team_name.
+    // 3c) Reset all players to FA
+    await supabase
+      .from("players")
+      .update({ status: "FA", owner_team_name: null });
+
+    // 3d) Mark taken players in batches
+    const allTaken = Array.from(takenIds);
+    const batchSize = 100;
+
+    for (let i = 0; i < allTaken.length; i += batchSize) {
+      const batch = allTaken.slice(i, i + batchSize);
+      const updates = batch.map((pid) => ({
+        nhl_id: pid,
+        status: "TAKEN",
+        owner_team_name: ownerById[pid] || null,
+      }));
+
+      const { error } = await supabase
+        .from("players")
+        .upsert(updates, { onConflict: "nhl_id" });
+      if (error) throw error;
+    }
 
     res.json({
       success: true,
-      message: `✅ Synced ${totalSynced} players (ownership debug phase logged)`,
+      message: `✅ Synced ${totalSynced} players with ownership`,
       count: totalSynced,
+      ownedCount: allTaken.length,
     });
   } catch (error) {
     console.error("SYNC_ERROR", error);
