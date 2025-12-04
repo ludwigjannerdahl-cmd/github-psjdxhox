@@ -1,13 +1,19 @@
 import { createClient } from "@supabase/supabase-js";
+import YahooFantasy from "yahoo-fantasy";
+
+const supabase = createClient(
+  "https://dtunbzugzcpzunnbvzmh.supabase.co",
+  "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM"
+);
+
+const CONSUMER_KEY = "dj0yJmk9bzdvRlE2Y0ZzdTZaJmQ9WVdrOVpYaDZNWHB4VG1JbWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PWRh";
+const CONSUMER_SECRET = "0c5463680eface4bb3958929f73c891d5618266a";
+const LEAGUE_KEY = "465.l.33897";
+const GAME_KEY = "465";
 
 export default async function handler(req, res) {
-  const supabase = createClient(
-    "https://dtunbzugzcpzunnbvzmh.supabase.co",
-    "sb_secret_gxW9Gf6-ThLoaB1BP0-HBw_yPOWTVcM"
-  );
-
   try {
-    // 1) REFRESH YAHOO TOKEN
+    // 1) Load Yahoo tokens from Supabase
     const { data: authData, error: authErr } = await supabase
       .from("system_config")
       .select("value")
@@ -15,69 +21,52 @@ export default async function handler(req, res) {
       .single();
 
     if (authErr) throw authErr;
-    if (!authData?.value?.refresh_token) {
-      throw new Error("No Yahoo auth token in system_config");
+    if (!authData?.value?.access_token) {
+      throw new Error("No yahoo_auth access_token stored");
     }
 
-    const tokenRes = await fetch(
-      "https://api.login.yahoo.com/oauth2/get_token",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          client_id:
-            "dj0yJmk9bzdvRlE2Y0ZzdTZaJmQ9WVdrOVpYaDZNWHB4VG1JbWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PWRh",
-          client_secret: "0c5463680eface4bb3958929f73c891d5618266a",
-          redirect_uri: "oob",
-          refresh_token: authData.value.refresh_token,
-          grant_type: "refresh_token",
-        }),
-      }
+    // 2) Init YahooFantasy client
+    const yf = new YahooFantasy(
+      CONSUMER_KEY,
+      CONSUMER_SECRET,
+      async (tokenData) => {
+        // refresh callback: persist new tokens
+        await supabase
+          .from("system_config")
+          .update({ value: { ...authData.value, ...tokenData } })
+          .eq("key", "yahoo_auth");
+      },
+      "oob"
     );
 
-    const tokens = await tokenRes.json();
-    if (tokens.error) {
-      throw new Error(
-        `Yahoo token refresh failed: ${
-          tokens.error_description || tokens.error
-        }`
-      );
+    yf.setUserToken(authData.value.access_token);
+    if (authData.value.refresh_token) {
+      yf.setRefreshToken(authData.value.refresh_token);
     }
 
-    await supabase
-      .from("system_config")
-      .update({
-        value: { ...authData.value, access_token: tokens.access_token },
-      })
-      .eq("key", "yahoo_auth");
-
-    const authHeader = { Authorization: `Bearer ${tokens.access_token}` };
-
-    // 2) PHASE A – STATS: SYNC ALL LEAGUE PLAYERS
+    // 3) PHASE A – pull league players + stats via wrapper
     let start = 0;
+    const pageSize = 25;
     let totalSynced = 0;
-    const syncedIds = []; // nhl_id list for ownership phase
+    const syncedIds = [];
 
     while (true) {
-      const statsRes = await fetch(
-        `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.33897/players;sort=AR;start=${start};count=25/stats?format=json`,
-        { headers: authHeader }
-      );
-      if (!statsRes.ok) break;
+      const url =
+        `/fantasy/v2/league/${LEAGUE_KEY}` +
+        `/players;sort=AR;start=${start};count=${pageSize}/stats`;
 
-      const statsJson = await statsRes.json();
+      const statsJson = await yf.api(yf.GET, url); // wrapper handles auth etc
+
       const leagueNode = statsJson.fantasy_content?.league;
-
       let playersObj = null;
+
       if (Array.isArray(leagueNode)) {
         playersObj = leagueNode.find((n) => n.players)?.players || null;
       } else {
         playersObj = leagueNode?.players || null;
       }
 
-      if (!playersObj || Object.keys(playersObj).length === 0) {
-        break;
-      }
+      if (!playersObj || Object.keys(playersObj).length === 0) break;
 
       const updates = [];
 
@@ -87,13 +76,13 @@ export default async function handler(req, res) {
         const wrapper = playersObj[key];
         if (!wrapper || !wrapper.player) continue;
 
-        const playerData = wrapper.player;
-        const segments = Array.isArray(playerData) ? playerData : [playerData];
+        const pData = wrapper.player;
+        const segs = Array.isArray(pData) ? pData : [pData];
 
         let metaObj = null;
         let statsObj = null;
 
-        segments.forEach((item) => {
+        segs.forEach((item) => {
           if (Array.isArray(item) && item.find((sub) => sub && sub.name)) {
             metaObj = item;
           } else if (item && item.player_stats) {
@@ -109,8 +98,7 @@ export default async function handler(req, res) {
         const idNode = metaObj.find((i) => i && i.player_id);
 
         if (!nameNode?.name?.full || !idNode?.player_id) continue;
-        const pidStr = idNode.player_id;
-        const pid = parseInt(pidStr, 10);
+        const pid = parseInt(idNode.player_id, 10);
         if (!Number.isFinite(pid)) continue;
 
         syncedIds.push(pid);
@@ -168,71 +156,64 @@ export default async function handler(req, res) {
         totalSynced += updates.length;
       }
 
-      start += 25;
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      start += pageSize;
+      await new Promise((r) => setTimeout(r, 500));
     }
 
-    // 3) PHASE B – OWNERSHIP VIA LEAGUE PLAYERS OWNERSHIP
+    // 4) PHASE B – ownership via league players ownership, still using yf.api
 
-    // Reset everyone to FA by default
     await supabase
       .from("players")
       .update({ status: "FA", owner_team_name: null });
 
     const uniqueIds = Array.from(new Set(syncedIds));
-    const gameKey = "465"; // NHL game key for 2025
+    const batchSize = 20;
 
-    const batchSize = 20; // player_keys per ownership call
     for (let i = 0; i < uniqueIds.length; i += batchSize) {
       const idBatch = uniqueIds.slice(i, i + batchSize);
-      const playerKeys = idBatch.map((pid) => `${gameKey}.p.${pid}`).join(",");
+      const playerKeys = idBatch.map((pid) => `${GAME_KEY}.p.${pid}`).join(",");
 
-      const ownRes = await fetch(
-        `https://fantasysports.yahooapis.com/fantasy/v2/league/465.l.33897/players;player_keys=${playerKeys}/ownership?format=json`,
-        { headers: authHeader }
-      );
+      const url =
+        `/fantasy/v2/league/${LEAGUE_KEY}` +
+        `/players;player_keys=${playerKeys}/ownership`;
 
-      if (!ownRes.ok) {
-        // skip this batch on error, continue with next
-        continue;
-      }
+      const ownJson = await yf.api(yf.GET, url);
 
-      const ownJson = await ownRes.json();
-      const leagueNode = ownJson.fantasy_content?.league;
+      const leagueNode2 = ownJson.fantasy_content?.league;
+      let playersObj2 = null;
 
-      let playersObj = null;
-      if (Array.isArray(leagueNode)) {
-        playersObj = leagueNode.find((n) => n.players)?.players || null;
+      if (Array.isArray(leagueNode2)) {
+        playersObj2 = leagueNode2.find((n) => n.players)?.players || null;
       } else {
-        playersObj = leagueNode?.players || null;
+        playersObj2 = leagueNode2?.players || null;
       }
-      if (!playersObj) continue;
+      if (!playersObj2) continue;
 
       const ownershipUpdates = [];
 
-      for (const key in playersObj) {
+      for (const key in playersObj2) {
         if (key === "count") continue;
 
-        const wrapper = playersObj[key];
+        const wrapper = playersObj2[key];
         if (!wrapper || !wrapper.player) continue;
 
         const pData = wrapper.player;
-        const pSegs = Array.isArray(pData) ? pData : [pData];
+        const segs = Array.isArray(pData) ? pData : [pData];
 
-        const idNode = pSegs.find((x) => x && x.player_id);
-        const statusNode =
-          pSegs.find((x) => x && x.status && x.status.ownership_type) ||
-          pSegs.find((x) => x && x.ownership && x.ownership.ownership_type);
+        const idNode = segs.find((x) => x && x.player_id);
+        const ownNode =
+          segs.find((x) => x && x.ownership && x.ownership.ownership_type) ||
+          segs.find((x) => x && x.status && x.status.ownership_type);
 
-        if (!idNode?.player_id || !statusNode) continue;
+        if (!idNode?.player_id || !ownNode) continue;
 
         const pid = parseInt(idNode.player_id, 10);
         if (!Number.isFinite(pid)) continue;
 
         const own =
-          statusNode.status && statusNode.status.ownership_type
-            ? statusNode.status
-            : statusNode.ownership;
+          ownNode.ownership && ownNode.ownership.ownership_type
+            ? ownNode.ownership
+            : ownNode.status;
 
         const ownershipType = own.ownership_type || "freeagents";
         const ownerName = own.owner_team_name || null;
@@ -255,16 +236,16 @@ export default async function handler(req, res) {
         if (error) throw error;
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await new Promise((r) => setTimeout(r, 500));
     }
 
     res.json({
       success: true,
-      message: `✅ Synced ${totalSynced} players with ownership`,
+      message: `Synced ${totalSynced} players with ownership`,
       count: totalSynced,
     });
-  } catch (error) {
-    console.error("SYNC_ERROR", error);
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    console.error("SYNC_ERROR", err);
+    res.status(500).json({ error: err.message });
   }
 }
