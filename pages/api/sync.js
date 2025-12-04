@@ -7,7 +7,7 @@ export default async function handler(req, res) {
   );
 
   try {
-    // 1. REFRESH YAHOO TOKEN
+    // 1) REFRESH YAHOO TOKEN
     const { data: authData } = await supabase
       .from("system_config")
       .select("value")
@@ -49,77 +49,37 @@ export default async function handler(req, res) {
       })
       .eq("key", "yahoo_auth");
 
-    // 2. SYNC ALL PLAYERS WITH STATS + OWNERSHIP
+    // 2) PHASE A – STATS: SYNC ALL LEAGUE PLAYERS
     let start = 0;
     let totalSynced = 0;
 
     while (true) {
-      // A) STATS CALL (what you already had)
       const statsRes = await fetch(
         `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.33897/players;sort=AR;start=${start};count=25/stats?format=json`,
         { headers: { Authorization: `Bearer ${tokens.access_token}` } }
       );
       if (!statsRes.ok) break;
+
       const statsJson = await statsRes.json();
+      const leagueNode = statsJson.fantasy_content?.league;
 
-      // B) OWNERSHIP CALL (new)
-      const ownRes = await fetch(
-        `https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.33897/players;sort=AR;start=${start};count=25;status=A;out=ownership,percent_owned?format=json`,
-        { headers: { Authorization: `Bearer ${tokens.access_token}` } }
-      );
-      if (!ownRes.ok) break;
-      const ownJson = await ownRes.json();
-
-      // Helper to get players object from league response
-      const extractPlayers = (root) => {
-        const leagueNode = root.fantasy_content?.league;
-        if (Array.isArray(leagueNode)) {
-          return leagueNode.find((n) => n.players)?.players || null;
-        }
-        return leagueNode?.players || null;
-      };
-
-      const statsPlayers = extractPlayers(statsJson);
-      const ownPlayers = extractPlayers(ownJson);
-
-      if (
-        !statsPlayers ||
-        Object.keys(statsPlayers).length === 0 ||
-        !ownPlayers ||
-        Object.keys(ownPlayers).length === 0
-      ) {
-        break;
+      let playersObj = null;
+      if (Array.isArray(leagueNode)) {
+        playersObj = leagueNode.find((n) => n.players)?.players || null;
+      } else {
+        playersObj = leagueNode?.players || null;
       }
 
-      // Build map: player_id -> { ownership_type, owner_team_name }
-      const ownershipById = {};
-      for (const key in ownPlayers) {
-        if (key === "count") continue;
-        const wrapper = ownPlayers[key];
-        if (!wrapper || !wrapper.player) continue;
-
-        const pdata = wrapper.player;
-        const segs = Array.isArray(pdata) ? pdata : [pdata];
-
-        segs.forEach((item) => {
-          if (item && item.ownership) {
-            const idNode = segs.find((i) => i && i.player_id);
-            const pid = idNode?.player_id;
-            if (!pid) return;
-            ownershipById[pid] = {
-              ownership_type: item.ownership.ownership_type,
-              owner_team_name: item.ownership.owner_team_name || null,
-            };
-          }
-        });
+      if (!playersObj || Object.keys(playersObj).length === 0) {
+        break; // no more pages
       }
 
       const updates = [];
 
-      for (const key in statsPlayers) {
+      for (const key in playersObj) {
         if (key === "count") continue;
 
-        const wrapper = statsPlayers[key];
+        const wrapper = playersObj[key];
         if (!wrapper || !wrapper.player) continue;
 
         const playerData = wrapper.player;
@@ -146,7 +106,7 @@ export default async function handler(req, res) {
         if (!nameNode?.name?.full || !idNode?.player_id) continue;
         const pid = idNode.player_id;
 
-        // STATS (hard-coded IDs)
+        // STATS (hard-coded Yahoo stat IDs)
         const stats = {};
         if (statsObj?.player_stats?.stats) {
           statsObj.player_stats.stats.forEach((w) => {
@@ -174,16 +134,6 @@ export default async function handler(req, res) {
           plus_minus * 0.5 +
           ppp * 1;
 
-        // OWNERSHIP FROM MAP
-        const own = ownershipById[pid] || null;
-        let status = "FA";
-        let ownerTeamName = null;
-
-        if (own) {
-          if (own.ownership_type === "team") status = "TAKEN";
-          if (own.owner_team_name) ownerTeamName = own.owner_team_name;
-        }
-
         updates.push({
           nhl_id: parseInt(pid, 10),
           full_name: nameNode.name.full,
@@ -197,8 +147,7 @@ export default async function handler(req, res) {
           sog: Math.round(sog),
           hits: Math.round(hits),
           blocks: Math.round(blocks),
-          status,
-          owner_team_name: ownerTeamName,
+          // status + owner_team_name are filled in Phase B
           fantasy_score: parseFloat(fantasyScore.toFixed(2)),
           last_updated: new Date().toISOString(),
         });
@@ -211,6 +160,105 @@ export default async function handler(req, res) {
 
       start += 25;
       await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
+    // 3) PHASE B – OWNERSHIP: USE ROSTERS TO TAG TAKEN VS FA
+
+    // 3a) Fetch all teams in the league
+    const leagueTeamsRes = await fetch(
+      "https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.33897/teams?format=json",
+      { headers: { Authorization: `Bearer ${tokens.access_token}` } }
+    );
+
+    const takenIds = new Set();
+    const ownerById = {};
+
+    if (leagueTeamsRes.ok) {
+      const leagueTeamsJson = await leagueTeamsRes.json();
+      const lNode = leagueTeamsJson.fantasy_content?.league;
+
+      let teamsObj = null;
+      if (Array.isArray(lNode)) {
+        teamsObj = lNode.find((n) => n.teams)?.teams || null;
+      } else {
+        teamsObj = lNode?.teams || null;
+      }
+
+      if (teamsObj) {
+        for (const key in teamsObj) {
+          if (key === "count") continue;
+          const tWrapper = teamsObj[key];
+          if (!tWrapper || !tWrapper.team) continue;
+
+          const teamData = tWrapper.team;
+          const tSegs = Array.isArray(teamData) ? teamData : [teamData];
+
+          const teamKeyNode = tSegs.find((i) => i && i.team_key);
+          const teamNameNode = tSegs.find((i) => i && i.name);
+
+          const teamKey = teamKeyNode?.team_key;
+          const teamName = teamNameNode?.name || "Unknown team";
+
+          if (!teamKey) continue;
+
+          // 3b) Roster for this team
+          const rosterRes = await fetch(
+            `https://fantasysports.yahooapis.com/fantasy/v2/team/${teamKey}/roster/players?format=json`,
+            { headers: { Authorization: `Bearer ${tokens.access_token}` } }
+          );
+
+          if (!rosterRes.ok) continue;
+          const rosterJson = await rosterRes.json();
+
+          const rTeamNode = rosterJson.fantasy_content?.team;
+          let rPlayersObj = null;
+
+          if (Array.isArray(rTeamNode)) {
+            const rosterNode = rTeamNode.find((n) => n.roster)?.roster;
+            if (rosterNode && rosterNode.players) {
+              rPlayersObj = rosterNode.players;
+            }
+          } else if (rTeamNode?.roster?.players) {
+            rPlayersObj = rTeamNode.roster.players;
+          }
+
+          if (!rPlayersObj) continue;
+
+          for (const pk in rPlayersObj) {
+            if (pk === "count") continue;
+            const pWrap = rPlayersObj[pk];
+            if (!pWrap || !pWrap.player) continue;
+
+            const pdata = pWrap.player;
+            const pSegs = Array.isArray(pdata) ? pdata : [pdata];
+            const idNode = pSegs.find((i) => i && i.player_id);
+            const pidStr = idNode?.player_id;
+            if (!pidStr) continue;
+
+            const pid = parseInt(pidStr, 10);
+            takenIds.add(pid);
+            ownerById[pid] = teamName;
+          }
+        }
+      }
+    }
+
+    // 3c) Reset everyone to FA
+    await supabase
+      .from("players")
+      .update({ status: "FA", owner_team_name: null });
+
+    // 3d) Mark taken players in batches
+    const allTaken = Array.from(takenIds);
+    const batchSize = 100;
+    for (let i = 0; i < allTaken.length; i += batchSize) {
+      const batch = allTaken.slice(i, i + batchSize);
+      const updates = batch.map((pid) => ({
+        nhl_id: pid,
+        status: "TAKEN",
+        owner_team_name: ownerById[pid] || null,
+      }));
+      await supabase.from("players").upsert(updates, { onConflict: "nhl_id" });
     }
 
     res.json({
