@@ -56,6 +56,7 @@ export default async function handler(req, res) {
     // 2) PHASE A – STATS: SYNC ALL LEAGUE PLAYERS
     let start = 0;
     let totalSynced = 0;
+    const syncedIds = []; // nhl_id list for ownership phase
 
     while (true) {
       const statsRes = await fetch(
@@ -108,7 +109,11 @@ export default async function handler(req, res) {
         const idNode = metaObj.find((i) => i && i.player_id);
 
         if (!nameNode?.name?.full || !idNode?.player_id) continue;
-        const pid = idNode.player_id;
+        const pidStr = idNode.player_id;
+        const pid = parseInt(pidStr, 10);
+        if (!Number.isFinite(pid)) continue;
+
+        syncedIds.push(pid);
 
         const stats = {};
         if (statsObj?.player_stats?.stats) {
@@ -138,7 +143,7 @@ export default async function handler(req, res) {
           ppp * 1;
 
         updates.push({
-          nhl_id: parseInt(pid, 10),
+          nhl_id: pid,
           full_name: nameNode.name.full,
           team: teamNode?.editorial_team_abbr || "UNK",
           position: posNode?.display_position || "F",
@@ -167,125 +172,96 @@ export default async function handler(req, res) {
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
 
-    // 3) PHASE B – OWNERSHIP FROM ROSTERS
+    // 3) PHASE B – OWNERSHIP VIA LEAGUE PLAYERS OWNERSHIP
 
-    // 3a) get all teams in league (you already logged this JSON)
-    const leagueTeamsRes = await fetch(
-      "https://fantasysports.yahooapis.com/fantasy/v2/league/nhl.l.33897/teams?format=json",
-      { headers: authHeader }
-    );
-
-    const takenIds = new Set();
-    const ownerById = {};
-
-    if (leagueTeamsRes.ok) {
-      const leagueTeamsJson = await leagueTeamsRes.json();
-      const lNode = leagueTeamsJson.fantasy_content?.league;
-
-      let teamsObj = null;
-      if (Array.isArray(lNode)) {
-        teamsObj = lNode.find((n) => n.teams)?.teams || null;
-      } else {
-        teamsObj = lNode?.teams || null;
-      }
-
-      if (teamsObj) {
-        for (const key in teamsObj) {
-          if (key === "count") continue;
-
-          const tWrapper = teamsObj[key];
-          if (!tWrapper || !tWrapper.team) continue;
-
-          const tData = tWrapper.team;
-          const tSegs = Array.isArray(tData) ? tData : [tData];
-
-          const teamKeyNode = tSegs.find((i) => i && i.team_key);
-          const teamNameNode = tSegs.find((i) => i && i.name);
-
-          const teamKey = teamKeyNode?.team_key;
-          const teamName = teamNameNode?.name || "Unknown team";
-
-          if (!teamKey) continue;
-
-          // 3b) roster for this team – we know from your sample the JSON has team + roster + roster.players
-          const rosterRes = await fetch(
-            `https://fantasysports.yahooapis.com/fantasy/v2/team/${teamKey}/roster/players?format=json`,
-            { headers: authHeader }
-          );
-          if (!rosterRes.ok) continue;
-
-          const rosterJson = await rosterRes.json();
-          const teamNode = rosterJson.fantasy_content?.team;
-
-          let playersArray = null;
-
-          if (Array.isArray(teamNode)) {
-            // structure: [ meta..., { roster: { players: { "0": {...}, ... } } } ]
-            const rosterNode = teamNode.find((n) => n.roster)?.roster;
-            if (rosterNode && Array.isArray(rosterNode.players)) {
-              // some wrappers flatten to array
-              playersArray = rosterNode.players;
-            } else if (rosterNode && rosterNode.players) {
-              playersArray = rosterNode.players;
-            }
-          } else if (teamNode?.roster?.players) {
-            playersArray = teamNode.roster.players;
-          }
-
-          if (!playersArray) continue;
-
-          // playersArray is an object with numeric keys or an array; your sample file is already flattened
-          const iterable =
-            Array.isArray(playersArray) ? playersArray : Object.values(playersArray);
-
-          for (const p of iterable) {
-            const playerObj = p.player || p; // depending on shape
-
-            const pidStr = playerObj.player_id;
-            if (!pidStr) continue;
-
-            const pid = parseInt(pidStr, 10);
-            takenIds.add(pid);
-
-            const own = playerObj.ownership;
-            const ownerName =
-              own?.owner_team_name && typeof own.owner_team_name === "string"
-                ? own.owner_team_name
-                : teamName;
-            ownerById[pid] = ownerName;
-          }
-        }
-      }
-    }
-
-    // 3c) Reset all players to FA
+    // Reset everyone to FA by default
     await supabase
       .from("players")
       .update({ status: "FA", owner_team_name: null });
 
-    // 3d) Mark taken players in batches
-    const allTaken = Array.from(takenIds);
-    const batchSize = 100;
+    const uniqueIds = Array.from(new Set(syncedIds));
+    const gameKey = "465"; // NHL game key for 2025
 
-    for (let i = 0; i < allTaken.length; i += batchSize) {
-      const batch = allTaken.slice(i, i + batchSize);
-      const updates = batch.map((pid) => ({
-        nhl_id: pid,
-        status: "TAKEN",
-        owner_team_name: ownerById[pid] || null,
-      }));
+    const batchSize = 20; // player_keys per ownership call
+    for (let i = 0; i < uniqueIds.length; i += batchSize) {
+      const idBatch = uniqueIds.slice(i, i + batchSize);
+      const playerKeys = idBatch.map((pid) => `${gameKey}.p.${pid}`).join(",");
 
-      const { error } = await supabase
-        .from("players")
-        .upsert(updates, { onConflict: "nhl_id" });
-      if (error) throw error;
+      const ownRes = await fetch(
+        `https://fantasysports.yahooapis.com/fantasy/v2/league/465.l.33897/players;player_keys=${playerKeys}/ownership?format=json`,
+        { headers: authHeader }
+      );
+
+      if (!ownRes.ok) {
+        // skip this batch on error, continue with next
+        continue;
+      }
+
+      const ownJson = await ownRes.json();
+      const leagueNode = ownJson.fantasy_content?.league;
+
+      let playersObj = null;
+      if (Array.isArray(leagueNode)) {
+        playersObj = leagueNode.find((n) => n.players)?.players || null;
+      } else {
+        playersObj = leagueNode?.players || null;
+      }
+      if (!playersObj) continue;
+
+      const ownershipUpdates = [];
+
+      for (const key in playersObj) {
+        if (key === "count") continue;
+
+        const wrapper = playersObj[key];
+        if (!wrapper || !wrapper.player) continue;
+
+        const pData = wrapper.player;
+        const pSegs = Array.isArray(pData) ? pData : [pData];
+
+        const idNode = pSegs.find((x) => x && x.player_id);
+        const statusNode =
+          pSegs.find((x) => x && x.status && x.status.ownership_type) ||
+          pSegs.find((x) => x && x.ownership && x.ownership.ownership_type);
+
+        if (!idNode?.player_id || !statusNode) continue;
+
+        const pid = parseInt(idNode.player_id, 10);
+        if (!Number.isFinite(pid)) continue;
+
+        const own =
+          statusNode.status && statusNode.status.ownership_type
+            ? statusNode.status
+            : statusNode.ownership;
+
+        const ownershipType = own.ownership_type || "freeagents";
+        const ownerName = own.owner_team_name || null;
+
+        let status = "FA";
+        if (ownershipType === "team") status = "TAKEN";
+        else if (ownershipType === "waivers") status = "WAIVER";
+
+        ownershipUpdates.push({
+          nhl_id: pid,
+          status,
+          owner_team_name: ownerName,
+        });
+      }
+
+      if (ownershipUpdates.length > 0) {
+        const { error } = await supabase
+          .from("players")
+          .upsert(ownershipUpdates, { onConflict: "nhl_id" });
+        if (error) throw error;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
 
     res.json({
       success: true,
       message: `✅ Synced ${totalSynced} players with ownership`,
       count: totalSynced,
-      ownedCount: allTaken.length,
     });
   } catch (error) {
     console.error("SYNC_ERROR", error);
